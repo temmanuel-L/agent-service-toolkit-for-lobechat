@@ -1,0 +1,49 @@
+{
+  "agents": [
+    {
+      "description": "A simple chatbot.",
+      "key": "chatbot"
+    },
+    {
+      "description": "A research assistant with web search and calculator.",
+      "key": "research-assistant"
+    },
+    {
+      "description": "A RAG assistant with access to information in a database.",
+      "key": "rag-assistant"
+    },
+    {
+      "description": "A command agent.",
+      "key": "command-agent"
+    },
+    {
+      "description": "A background task agent.",
+      "key": "bg-task-agent"
+    },
+    {
+      "description": "A langgraph supervisor agent",
+      "key": "langgraph-supervisor-agent"
+    },
+    {
+      "description": "A langgraph supervisor agent with a nested hierarchy of agents",
+      "key": "langgraph-supervisor-hierarchy-agent"
+    },
+    {
+      "description": "An agent the uses interrupts.",
+      "key": "interrupt-agent"
+    },
+    {
+      "description": "A retrieval-augmented generation agent using Amazon Bedrock Knowledge Base",
+      "key": "knowledge-base-agent"
+    },
+    {
+      "description": "A GitHub agent with MCP tools for repository management and development workflows.",
+      "key": "github-mcp-agent"
+    }
+  ],
+  "default_agent": "research-assistant",
+  "default_model": "alibayram/Qwen3-30B-A3B-Instruct-2507:latest",
+  "models": [
+    "alibayram/Qwen3-30B-A3B-Instruct-2507:latest"
+  ]
+}

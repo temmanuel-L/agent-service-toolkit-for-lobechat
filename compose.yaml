@@ -1,0 +1,131 @@
+version: "3.3"
+
+services:
+  postgres:
+    container_name: postgres-${APP_NAME}-${TAG}
+    image: postgres:16
+    env_file:
+      - .env
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    environment:
+      - POSTGRES_HOST=${POSTGRES_HOST:-127.0.0.1}
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
+      - POSTGRES_DB=${POSTGRES_DB:-postgres}
+      - POSTGRES_PORT=5432
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres-init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-postgres}" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  qdrant:
+    container_name: qdrant-${APP_NAME}-${TAG}
+    image: qdrant/qdrant
+    ports:
+      - "${QDRANT_PORT:-6334}:${QDRANT_PORT:-6334}"
+    environment:
+      - QDRANT__SERVICE__HTTP_PORT=${QDRANT_PORT:-6334}
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+  agent_service:
+    container_name: agent_service-${APP_NAME}-${TAG}
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.service
+    ports:
+      - "${PORT:-8081}:${PORT:-8081}"
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:${PORT:-8081}/info" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    environment:
+      - QDRANT_URL=http://qdrant:${QDRANT_PORT:-6334}
+    volumes:
+      - log:/log/
+    develop:
+      watch:
+        - path: src/agents/
+          action: sync+restart
+          target: /app/agents/
+        - path: src/schema/
+          action: sync+restart
+          target: /app/schema/
+        - path: src/service/
+          action: sync+restart
+          target: /app/service/
+        - path: src/core/
+          action: sync+restart
+          target: /app/core/
+        - path: src/memory/
+          action: sync+restart
+          target: /app/memory/
+
+  langfuse-clickhouse:
+    container_name: langfuse-clickhouse-${APP_NAME}-${TAG}
+    image: clickhouse/clickhouse-server:24.8
+    restart: unless-stopped
+    environment:
+      - CLICKHOUSE_DB=langfuse
+      - CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1
+    volumes:
+      - langfuse_clickhouse_data:/var/lib/clickhouse
+
+  langfuse-redis:
+    container_name: langfuse-redis-${APP_NAME}-${TAG}
+    image: redis:7
+    restart: unless-stopped
+    command: >
+      sh -c "redis-server --save 60 1 --loglevel warning"
+    volumes:
+      - langfuse_redis_data:/data
+
+  langfuse:
+    container_name: langfuse-${APP_NAME}-${TAG}
+    image: langfuse/langfuse:2
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      langfuse-clickhouse:
+        condition: service_started
+      langfuse-redis:
+        condition: service_started
+    ports:
+      - "${LANGFUSE_PORT:-3001}:8080"
+    environment:
+      - SALT=VgP2jS3p9uLq7xY1zW8nK4dC6mR0tB5qH2fD9sL8cA3wE7r
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/langfuse
+
+      - CLICKHOUSE_URL=http://langfuse-clickhouse:8123
+
+      - CLICKHOUSE_MIGRATION_URL=clickhouse://langfuse-clickhouse:9000/langfuse
+
+      # - CLICKHOUSE_USER=xxx
+      # - CLICKHOUSE_PASSWORD=xxx
+
+      - REDIS_HOST=langfuse-redis
+      - NEXTAUTH_SECRET=${LANGFUSE_NEXTAUTH_SECRET:-changeme}
+      - NEXTAUTH_URL=${LANGFUSE_PUBLIC_URL:-http://localhost:${LANGFUSE_PORT:-3000}}
+      - LANGFUSE_LICENSE_KEY=${LANGFUSE_LICENSE_KEY:-}
+      - LANGFUSE_HOST=${LANGFUSE_LICENSE_KEY:-http://localhost:3000}
+
+volumes:
+  postgres_data:
+  qdrant_data:
+  log:
+  langfuse_clickhouse_data:
+  langfuse_redis_data:

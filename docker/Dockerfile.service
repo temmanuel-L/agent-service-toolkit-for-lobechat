@@ -1,0 +1,26 @@
+FROM python:3.12.3-slim
+
+WORKDIR /app
+
+ENV UV_PROJECT_ENVIRONMENT="/usr/local/"
+ENV UV_COMPILE_BYTECODE=1
+ENV PYTHONPATH=".:src"
+ENV TZ="Asia/Shanghai"
+ENV PIP_DEFAULT_TIMEOUT=120
+ENV PIP_INDEX_URL="https://pypi.tuna.tsinghua.edu.cn/simple"
+ENV PIP_TRUSTED_HOST="pypi.tuna.tsinghua.edu.cn"
+
+COPY pyproject.toml .
+COPY uv.lock .
+RUN pip install --no-cache-dir uv
+RUN uv sync --frozen --no-install-project --no-dev
+
+COPY src/agents/ ./agents/
+COPY src/core/ ./core/
+COPY src/memory/ ./memory/
+COPY src/schema/ ./schema/
+COPY src/service/ ./service/
+COPY src/utils/ ./utils/
+COPY src/run_service.py .
+
+CMD ["python", "run_service.py"]
