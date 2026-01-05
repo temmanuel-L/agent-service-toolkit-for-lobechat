@@ -79,12 +79,32 @@ async def get_qdrant_store(
         # Use in-memory storage for testing/development
         location = ":memory:"
 
-    return Qdrant(
-        location=location,
-        collection_name=collection_name,
-        embeddings=embeddings,
-        **kwargs,
-    )
+    # 根据location类型选择适当的初始化方式
+    if location == ":memory:" or location.startswith("sqlite"):
+        # 使用本地模式
+        return Qdrant.from_memory(
+            collection_name=collection_name,
+            embeddings=embeddings,
+            **kwargs,
+        )
+    else:
+        # 使用远程服务器模式
+        # 根据Qdrant源码，需要传入QdrantClient实例
+        from qdrant_client import QdrantClient
+        client = QdrantClient(
+            url=location,
+            api_key=kwargs.pop("api_key", None),
+        )
+        return Qdrant(
+            client=client,
+            collection_name=collection_name,
+            embeddings=embeddings,
+            content_payload_key=kwargs.pop("content_payload_key", Qdrant.CONTENT_KEY),
+            metadata_payload_key=kwargs.pop("metadata_payload_key", Qdrant.METADATA_KEY),
+            distance_strategy=kwargs.pop("distance_strategy", "COSINE"),
+            vector_name=kwargs.pop("vector_name", Qdrant.VECTOR_NAME),
+            **kwargs,
+        )
 
 @asynccontextmanager
 async def get_qdrant_client():
@@ -98,8 +118,7 @@ async def get_qdrant_client():
     if settings.QDRANT_HOST and settings.QDRANT_PORT:
         # Use remote Qdrant instance
         client = AsyncQdrantClient(
-            url=f"http://{settings.QDRANT_HOST}:{settings.QDRANT_PORT}",
-            api_key=settings.QDRANT_API_KEY.get_secret_value() if settings.QDRANT_API_KEY else None,
+            url=get_qdrant_connection_string(),
         )
     else:
         # Use in-memory storage for testing/development
@@ -107,7 +126,7 @@ async def get_qdrant_client():
     
     try:
         if settings.QDRANT_HOST and settings.QDRANT_PORT:
-            logger.debug(f"正在初始化 Qdrant 客户端：http://{settings.QDRANT_HOST}:{settings.QDRANT_PORT}")
+            logger.debug(f"正在初始化 Qdrant 客户端：{get_qdrant_connection_string()}")
             # 简单健康检查
             await client.get_collections()
         yield client

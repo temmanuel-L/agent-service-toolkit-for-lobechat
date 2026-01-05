@@ -45,7 +45,7 @@ _MODEL_TABLE = (
 # Embedding 模型映射表
 _EMBEDDING_MODEL_TABLE = {
     "openai": "text-embedding-3-small",
-    "ollama": "bge-m3:latest",
+    "ollama": "nomic-embed-text:latest",
 }
 
 

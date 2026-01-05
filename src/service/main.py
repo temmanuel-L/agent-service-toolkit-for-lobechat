@@ -30,9 +30,9 @@ router = APIRouter(dependencies=[Depends(verify_bearer)])
 app = FastAPI(
     lifespan=lifespan,
     generate_unique_id_function=lambda route: route.name,
-    docs_url=None,
-    redoc_url=None,
-    openapi_url=None,
+    # docs_url=None,
+    # redoc_url=None,
+    # openapi_url=None,
 )
 
 
@@ -224,7 +224,6 @@ async def openai_chat_completions(
     Returns:
         Any: OpenAI格式的聊天完成响应
     """
-    from agents.agents import DEFAULT_AGENT
     # 优先使用特定头信息，然后是通用头信息
     effective_user_id = user_id or x_user_id or None
     
@@ -242,53 +241,10 @@ async def openai_chat_completions(
     
     # 优先级：直接传递的thread_id > 从lobe-trace中提取的sessionId > x_thread_id
     effective_thread_id = thread_id or extracted_thread_id or x_thread_id or None
-    return await chat_completions_handler(request, DEFAULT_AGENT, effective_user_id, effective_thread_id)
-
-@app.post("/v1/chat/completions/{agent_id}")
-async def openai_chat_completions_with_agent(
-    agent_id: str,
-    request: OpenAIChatCompletionRequest,
-    user_id: str = Header(None, alias="user-id"),
-    thread_id: str = Header(None, alias="thread-id"),
-    x_user_id: str = Header(None, alias="x-user-id"),
-    x_thread_id: str = Header(None, alias="x-thread-id"),
-    x_lobe_trace: str = Header(None, alias="x-lobe-trace")
-):
-    """
-    OpenAI兼容的聊天完成接口（指定agent）
-
-    该接口提供与OpenAI API兼容的聊天完成功能，支持指定特定agent，支持流式响应
-    从请求头获取user_id和thread_id用于数据存储和检索
-    支持从X-lobe-trace头中提取sessionId作为thread_id
-
-    Args:
-        agent_id (str): 指定的agent ID
-        request (OpenAIChatCompletionRequest): OpenAI格式的聊天完成请求
-        user_id (str, optional): 用户ID，从请求头获取
-        thread_id (str, optional): 会话ID，从请求头获取
-        x_user_id (str, optional): 备用用户ID，从请求头获取
-        x_thread_id (str, optional): 备用会话ID，从请求头获取
-
-    Returns:
-        Any: OpenAI格式的聊天完成响应
-    """
-    # 优先使用特定头信息，然后是通用头信息
-    effective_user_id = user_id or x_user_id or None
     
-    # 从x-lobe-trace头中提取sessionId作为thread_id
-    extracted_thread_id = None
-    if x_lobe_trace:
-        try:
-            # 解码base64编码的trace信息
-            decoded_trace = base64.b64decode(x_lobe_trace).decode('utf-8')
-            trace_data = json.loads(decoded_trace)
-            extracted_thread_id = trace_data.get('sessionId')
-        except Exception:
-            # 如果解析失败，忽略错误
-            pass
+    # 将 request.model 作为 agent_id 传递
+    agent_id = request.model if request.model else None
     
-    # 优先级：直接传递的thread_id > 从lobe-trace中提取的sessionId > x_thread_id
-    effective_thread_id = thread_id or extracted_thread_id or x_thread_id or None
     return await chat_completions_handler(request, agent_id, effective_user_id, effective_thread_id)
 
 

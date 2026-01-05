@@ -12,6 +12,7 @@ ENV PIP_TRUSTED_HOST="pypi.tuna.tsinghua.edu.cn"
 
 COPY pyproject.toml .
 COPY uv.lock .
+RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir uv
 RUN uv sync --frozen --no-install-project --no-dev
 
