@@ -73,7 +73,7 @@ async def get_qdrant_store(
     from core.settings import settings
     if settings.QDRANT_HOST and settings.QDRANT_PORT:
         # Use remote Qdrant instance
-        location = f"http://{settings.QDRANT_HOST}:{settings.QDRANT_PORT}"
+        location = get_qdrant_connection_string()
         kwargs["api_key"] = settings.QDRANT_API_KEY.get_secret_value() if settings.QDRANT_API_KEY else None
     else:
         # Use in-memory storage for testing/development
@@ -82,7 +82,9 @@ async def get_qdrant_store(
     # 根据location类型选择适当的初始化方式
     if location == ":memory:" or location.startswith("sqlite"):
         # 使用本地模式
+        client = AsyncQdrantClient(location=location)
         return Qdrant.from_memory(
+            client=client,
             collection_name=collection_name,
             embeddings=embeddings,
             **kwargs,
@@ -90,19 +92,17 @@ async def get_qdrant_store(
     else:
         # 使用远程服务器模式
         # 根据Qdrant源码，需要传入QdrantClient实例
-        from qdrant_client import QdrantClient
-        client = QdrantClient(
+        client = AsyncQdrantClient(
             url=location,
-            api_key=kwargs.pop("api_key", None),
         )
         return Qdrant(
             client=client,
             collection_name=collection_name,
             embeddings=embeddings,
-            content_payload_key=kwargs.pop("content_payload_key", Qdrant.CONTENT_KEY),
-            metadata_payload_key=kwargs.pop("metadata_payload_key", Qdrant.METADATA_KEY),
-            distance_strategy=kwargs.pop("distance_strategy", "COSINE"),
-            vector_name=kwargs.pop("vector_name", Qdrant.VECTOR_NAME),
+            # content_payload_key=kwargs.pop("content_payload_key", Qdrant.CONTENT_KEY),
+            # metadata_payload_key=kwargs.pop("metadata_payload_key", Qdrant.METADATA_KEY),
+            # distance_strategy=kwargs.pop("distance_strategy", "COSINE"),
+            # vector_name=kwargs.pop("vector_name", Qdrant.VECTOR_NAME),
             **kwargs,
         )
 

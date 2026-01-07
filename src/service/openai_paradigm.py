@@ -49,7 +49,7 @@ async def chat_completions_handler(
         message=user_message,
         user_id=user_id,
         thread_id=thread_id,  # 使用传入的 thread_id
-        model=request.model if request.model else None,
+        model=None,
         stream_tokens=request.stream,
         # 将 OpenAI 的参数映射到 agent_config 中
         agent_config={

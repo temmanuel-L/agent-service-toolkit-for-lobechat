@@ -12,6 +12,7 @@ name = "agent-service-toolkit"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "concurrent-log" },
     { name = "ddgs" },
     { name = "docx2txt" },
     { name = "duckduckgo-search" },
@@ -77,6 +78,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "concurrent-log", specifier = ">=1.0.1" },
     { name = "ddgs", specifier = ">=9.9.1" },
     { name = "docx2txt", specifier = "~=0.8" },
     { name = "duckduckgo-search", specifier = ">=7.3.0" },
@@ -747,6 +749,15 @@ sdist = { url = "https://files.pythonhosted.org/packages/cc/c7/eed8f27100517e8c0
 wheels = [
     { url = "https://files.pythonhosted.org/packages/a7/06/3d6badcf13db419e25b07041d9c7b4a2c331d3f4e7134445ec5df57714cd/coloredlogs-15.0.1-py2.py3-none-any.whl", hash = "sha256:612ee75c546f53e92e70049c9dbfcc18c935a2b9a53b66085ce9ef6a6e5c0934", size = 46018, upload-time = "2021-06-11T10:22:42.561Z" },
 ]
+
+[[package]]
+name = "concurrent-log"
+version = "1.0.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "portalocker" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/55/ba/464ffcb0c1042050cd6dd68981c2534b498fe28a908738f2a97268e7eba9/concurrent_log-1.0.1.tar.gz", hash = "sha256:cc4dff5b68c6510483908b19e3dd75372c5509851a77002e184e0448f8b3e37b", size = 5889, upload-time = "2019-12-30T09:07:55.411Z" }
 
 [[package]]
 name = "coverage"
