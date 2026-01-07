@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional
 from langchain_core.embeddings import Embeddings
 from langchain_qdrant import Qdrant
 from pydantic import SecretStr
-from qdrant_client import AsyncQdrantClient, models
+from qdrant_client import QdrantClient, AsyncQdrantClient, models
 from qdrant_client.http import models as qdrant_models
 
 from core.llm import get_embedding_model
@@ -82,8 +82,8 @@ async def get_qdrant_store(
     # 根据location类型选择适当的初始化方式
     if location == ":memory:" or location.startswith("sqlite"):
         # 使用本地模式
-        client = AsyncQdrantClient(location=location)
-        return Qdrant.from_memory(
+        client = QdrantClient(location=location)
+        return Qdrant(
             client=client,
             collection_name=collection_name,
             embeddings=embeddings,
@@ -92,9 +92,7 @@ async def get_qdrant_store(
     else:
         # 使用远程服务器模式
         # 根据Qdrant源码，需要传入QdrantClient实例
-        client = AsyncQdrantClient(
-            url=location,
-        )
+        client = QdrantClient(url=location)
         return Qdrant(
             client=client,
             collection_name=collection_name,
@@ -147,7 +145,7 @@ async def get_qdrant_client():
 async def adelete_points_by_metadata(
     collection_name: str,
     metadata_filter: Dict[str, Any],
-    client: Optional[AsyncQdrantClient] = None
+    client: Optional[QdrantClient] = None
 ) -> bool:
     """
     Delete points from a Qdrant collection based on metadata filter.
@@ -166,7 +164,7 @@ async def adelete_points_by_metadata(
         if settings.QDRANT_HOST and settings.QDRANT_PORT:
             # Use remote Qdrant instance
             client = AsyncQdrantClient(
-                url=f"http://{settings.QDRANT_HOST}:{settings.QDRANT_PORT}",
+                url=get_qdrant_connection_string(),
                 api_key=settings.QDRANT_API_KEY.get_secret_value() if settings.QDRANT_API_KEY else None,
             )
         else:

@@ -45,7 +45,7 @@ services:
       context: .
       dockerfile: docker/Dockerfile.service
     ports:
-      - "${PORT:-8081}:${PORT:-8081}"
+      - "${PORT:-8080}:${PORT:-8080}"
     env_file:
       - .env
     depends_on:
@@ -64,6 +64,7 @@ services:
       - QDRANT_URL=http://qdrant:${QDRANT_PORT:-6333}
     volumes:
       - log:/log/
+      - ./src:/app/src
     develop:
       watch:
         - path: src/agents/
