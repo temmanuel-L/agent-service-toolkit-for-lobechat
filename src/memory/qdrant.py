@@ -153,13 +153,13 @@ async def adelete_points_by_metadata(
         from core.settings import settings
         if settings.QDRANT_HOST and settings.QDRANT_PORT:
             # Use remote Qdrant instance
-            client = AsyncQdrantClient(
+            client = QdrantClient(
                 url=get_qdrant_connection_string(),
                 api_key=settings.QDRANT_API_KEY.get_secret_value() if settings.QDRANT_API_KEY else None,
             )
         else:
             # Use in-memory storage for testing/development
-            client = AsyncQdrantClient(location=":memory:")
+            client = QdrantClient(location=":memory:")
     
     try:
         # Build the filter conditions
