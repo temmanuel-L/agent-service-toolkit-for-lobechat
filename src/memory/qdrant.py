@@ -2,12 +2,14 @@ from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
 from langchain_core.embeddings import Embeddings
-from langchain_qdrant import Qdrant
+from langchain_qdrant import Qdrant, QdrantVectorStore
 from pydantic import SecretStr
 from qdrant_client import QdrantClient, AsyncQdrantClient, models
 from qdrant_client.http import models as qdrant_models
 
 from core.llm import get_embedding_model
+import inspect
+from core.settings import settings
 from schema import ChatMessage
 from utils.log_utils import get_logger
 
@@ -83,44 +85,32 @@ async def get_qdrant_store(
     if location == ":memory:" or location.startswith("sqlite"):
         # 使用本地模式
         client = QdrantClient(location=location)
-        return Qdrant(
-            client=client,
-            collection_name=collection_name,
-            embeddings=embeddings,
-            **kwargs,
-        )
     else:
         # 使用远程服务器模式
-        # 根据Qdrant源码，需要传入QdrantClient实例
         client = QdrantClient(url=location)
-        return Qdrant(
-            client=client,
-            collection_name=collection_name,
-            embeddings=embeddings,
-            # content_payload_key=kwargs.pop("content_payload_key", Qdrant.CONTENT_KEY),
-            # metadata_payload_key=kwargs.pop("metadata_payload_key", Qdrant.METADATA_KEY),
-            # distance_strategy=kwargs.pop("distance_strategy", "COSINE"),
-            # vector_name=kwargs.pop("vector_name", Qdrant.VECTOR_NAME),
-            **kwargs,
-        )
+    return Qdrant(
+        client=client,
+        collection_name=collection_name,
+        embeddings=embeddings,
+        # content_payload_key=kwargs.pop("content_payload_key", Qdrant.CONTENT_KEY),
+        # metadata_payload_key=kwargs.pop("metadata_payload_key", Qdrant.METADATA_KEY),
+        # distance_strategy=kwargs.pop("distance_strategy", "COSINE"),
+        # vector_name=kwargs.pop("vector_name", Qdrant.VECTOR_NAME),
+        **kwargs,
+    )
 
 @asynccontextmanager
 async def get_qdrant_client():
     """
     Create and yield a Qdrant client instance.
     """
-    import inspect
-    from core.settings import settings
-    
     # Determine the appropriate connection parameters
     if settings.QDRANT_HOST and settings.QDRANT_PORT:
         # Use remote Qdrant instance
-        client = AsyncQdrantClient(
-            url=get_qdrant_connection_string(),
-        )
+        client = QdrantClient(url=get_qdrant_connection_string(),)
     else:
         # Use in-memory storage for testing/development
-        client = AsyncQdrantClient(location=":memory:")
+        client = QdrantClient(location=":memory:")
     
     try:
         if settings.QDRANT_HOST and settings.QDRANT_PORT:
