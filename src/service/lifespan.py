@@ -11,6 +11,7 @@ from agents import get_agent, get_all_agent_info, load_agent
 from memory import initialize_database, initialize_store
 from memory.qdrant import get_qdrant_client
 from memory.vector_manager import VectorManager
+from core import get_embedding_model
 from .service import cleanup_manager
 from utils.log_utils import get_logger
 
@@ -59,6 +60,7 @@ async def _ensure_qdrant_collection(
     agent_key: str,
     qdrant_client: Any,
     existing_collections: set[str],
+    vector_size: int,  # 新增参数：向量维度
 ) -> None:
     """
     确保Qdrant集合存在，如果不存在则创建
@@ -70,6 +72,7 @@ async def _ensure_qdrant_collection(
         agent_key (str): Agent的唯一标识符，用作集合名称
         qdrant_client (Any): Qdrant客户端实例，用于与向量数据库通信
         existing_collections (set[str]): 已存在的集合名称集合，用于避免重复创建
+        vector_size (int): 向量维度（例如 768, 1536），由实际 embedding 模型决定
     """
     if agent_key in existing_collections:
         logger.info("Qdrant collection %s 已存在，跳过创建", agent_key)
@@ -80,7 +83,7 @@ async def _ensure_qdrant_collection(
         await qdrant_client.create_collection(
             collection_name=agent_key,
             vectors_config=qdrant_models.VectorParams(
-                size=1536,  # OpenAI ada-002 embedding 维度
+                size=vector_size,  # OpenAI ada-002 embedding 维度
                 distance=qdrant_models.Distance.COSINE,
             ),
         )
@@ -101,6 +104,7 @@ async def _initialize_agent_resources(
     store: Any,
     qdrant_client: Any,
     existing_collections: set[str],
+    vector_size: int,  # 新增参数：向量维度
 ) -> None:
     """
     初始化Agent资源并设置相关属性
@@ -114,6 +118,7 @@ async def _initialize_agent_resources(
         store (Any): 存储器对象
         qdrant_client (Any): Qdrant客户端实例
         existing_collections (set[str]): 已存在的集合名称集合
+        vector_size int:  新增参数：向量维度
     """
     try:
         await load_agent(agent_key)
@@ -124,7 +129,7 @@ async def _initialize_agent_resources(
     agent = get_agent(agent_key)
     agent.checkpointer = saver
     agent.store = store
-    await _ensure_qdrant_collection(agent_key, qdrant_client, existing_collections)
+    await _ensure_qdrant_collection(agent_key, qdrant_client, existing_collections, vector_size)
     
     # 设置 Qdrant 相关属性
     setattr(agent, "qdrant_client", qdrant_client)
@@ -160,6 +165,11 @@ async def lifespan(app) -> AsyncGenerator[None, None]:
         try:
             # 启动数据清理任务
             cleanup_task = asyncio.create_task(cleanup_manager.start_cleanup_scheduler())
+
+            # --- 新增：获取全局 embedding 实例 ---
+            # 这个实例应该和 VectorManager 内部使用的完全相同
+            global_embeddings = get_embedding_model()
+            vector_size = len(global_embeddings.embed_query("hello"))  # 动态获取维度
             
             # 初始化 Qdrant 客户端
             qdrant_client = await stack.enter_async_context(get_qdrant_client())
@@ -170,18 +180,56 @@ async def lifespan(app) -> AsyncGenerator[None, None]:
                 saver = await stack.enter_async_context(initialize_database())
                 store = await stack.enter_async_context(initialize_store())
                 await _setup_memory_components(saver, store)
+                # await _ensure_qdrant_collection(
+                #     agent_info.key,
+                #     qdrant_client,
+                #     existing_collections,
+                #     vector_size=vector_size,
+                # )
                 await _initialize_agent_resources(
                     agent_info.key,
                     saver,
                     store,
                     qdrant_client,
                     existing_collections,
+                    vector_size
                 )
                 
             # 设置清理管理器的 saver 引用，以便进行数据清理
             # 注意：这里使用最后一个saver，但理想情况下应该有一个机制来访问所有saver以进行完整的清理
             cleanup_manager.saver = saver
             
+            # --- 确保全局向量集合 'agent_conversations' 存在 ---
+            GLOBAL_VECTOR_COLLECTION = "agent_conversations"
+            # 步骤1: 检查集合是否存在
+            collection_exists = GLOBAL_VECTOR_COLLECTION in existing_collections
+            if collection_exists:
+                # 步骤2: 如果存在，检查维度是否匹配
+                try:
+                    collection_info = await qdrant_client.get_collection(GLOBAL_VECTOR_COLLECTION)
+                    current_dim = collection_info.config.params.vectors.size
+                    if current_dim != vector_size:
+                        logger.warning(
+                            f"集合 '{GLOBAL_VECTOR_COLLECTION}' 维度 ({current_dim}) 与当前 embedding 维度 ({vector_size}) 不匹配，正在重建..."
+                        )
+                        # 删除旧集合
+                        await qdrant_client.delete_collection(GLOBAL_VECTOR_COLLECTION)
+                        collection_exists = False
+                except Exception as e:
+                    logger.error(f"检查集合 '{GLOBAL_VECTOR_COLLECTION}' 时出错: {e}")
+                    # 如果检查失败，也当作不存在处理
+                    collection_exists = False
+
+            # 步骤3: 如果集合不存在，则创建它
+            if not collection_exists:
+                logger.info(f"正在创建全局向量集合: {GLOBAL_VECTOR_COLLECTION} (维度: {vector_size})")
+                await _ensure_qdrant_collection(
+                    GLOBAL_VECTOR_COLLECTION,
+                    qdrant_client,
+                    existing_collections,  # 注意：这个变量现在可能已过期，但我们函数内部会再获取一次
+                    vector_size=vector_size,
+                )
+
             # 初始化向量管理器
             vector_manager = VectorManager()
             await vector_manager.ainitialize()

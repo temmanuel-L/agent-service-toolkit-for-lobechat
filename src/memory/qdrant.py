@@ -23,7 +23,6 @@ def validate_qdrant_config() -> None:
     Raises:
         ValueError: 缺少必要的 Qdrant 配置错误
     """
-    from core.settings import settings
     required_vars = [
         "QDRANT_HOST",
         "QDRANT_PORT",
@@ -54,7 +53,7 @@ async def get_qdrant_store(
     embeddings: Optional[Embeddings] = None,
     location: Optional[str] = ":memory:",
     **kwargs: Any,
-) -> Qdrant:
+) -> QdrantVectorStore:
     """
     Create a Qdrant instance with the specified parameters.
 
@@ -71,12 +70,14 @@ async def get_qdrant_store(
     if embeddings is None:
         embeddings = get_embedding_model()
 
+    api_key = None
+    if settings.QDRANT_API_KEY:
+        api_key = settings.QDRANT_API_KEY.get_secret_value()
+
     # Get connection parameters from settings
-    from core.settings import settings
     if settings.QDRANT_HOST and settings.QDRANT_PORT:
         # Use remote Qdrant instance
         location = get_qdrant_connection_string()
-        kwargs["api_key"] = settings.QDRANT_API_KEY.get_secret_value() if settings.QDRANT_API_KEY else None
     else:
         # Use in-memory storage for testing/development
         location = ":memory:"
@@ -87,11 +88,14 @@ async def get_qdrant_store(
         client = QdrantClient(location=location)
     else:
         # 使用远程服务器模式
-        client = QdrantClient(url=location)
-    return Qdrant(
+        client = QdrantClient(
+            url=location,
+            api_key=api_key
+        )
+    return QdrantVectorStore(
         client=client,
         collection_name=collection_name,
-        embeddings=embeddings,
+        embedding=embeddings,
         # content_payload_key=kwargs.pop("content_payload_key", Qdrant.CONTENT_KEY),
         # metadata_payload_key=kwargs.pop("metadata_payload_key", Qdrant.METADATA_KEY),
         # distance_strategy=kwargs.pop("distance_strategy", "COSINE"),

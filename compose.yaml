@@ -7,7 +7,8 @@ services:
     env_file:
       - .env
     ports:
-      - "${POSTGRES_PORT:-5433}:5432"
+      # - "${POSTGRES_PORT:-5433}:5432"
+      - "5433:5432"
     environment:
       - POSTGRES_HOST=${POSTGRES_HOST:-127.0.0.1}
       - POSTGRES_USER=${POSTGRES_USER:-postgres}
