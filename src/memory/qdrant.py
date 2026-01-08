@@ -4,8 +4,7 @@ from typing import Any, Dict, List, Optional
 from langchain_core.embeddings import Embeddings
 from langchain_qdrant import Qdrant, QdrantVectorStore
 from pydantic import SecretStr
-from qdrant_client import QdrantClient, models
-from qdrant_client.async_qdrant_client import AsyncQdrantClient
+from qdrant_client import QdrantClient, models, AsyncQdrantClient
 from qdrant_client.http import models as qdrant_models
 
 from core.llm import get_embedding_model
@@ -85,10 +84,10 @@ async def get_qdrant_store(
     # 根据location类型选择适当的初始化方式
     if location == ":memory:" or location.startswith("sqlite"):
         # 使用本地模式
-        client = AsyncQdrantClient(location=location)
+        client = QdrantClient(location=location)
     else:
         # 使用远程服务器模式
-        client = AsyncQdrantClient(url=location)
+        client = QdrantClient(url=location)
     return Qdrant(
         client=client,
         collection_name=collection_name,
@@ -151,7 +150,6 @@ async def adelete_points_by_metadata(
     """
     own_client = client is None
     if own_client:
-        from core.settings import settings
         if settings.QDRANT_HOST and settings.QDRANT_PORT:
             # Use remote Qdrant instance
             client = QdrantClient(
