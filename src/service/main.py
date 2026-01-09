@@ -1,7 +1,9 @@
 """
 主服务模块 - 组合所有路由和应用
 """
-from fastapi import APIRouter, Depends, FastAPI, Header, Query
+import base64
+import json
+from fastapi import APIRouter, Depends, FastAPI, Header, Query, Request
 from fastapi.responses import StreamingResponse
 
 from schema import (
@@ -23,6 +25,9 @@ from .lifespan import lifespan
 from .responses import _sse_response_example
 from .task_manager import stop_task as task_manager_stop_task
 from .openai_paradigm import chat_completions_handler
+from utils.log_utils import get_logger
+
+logger = get_logger(__name__)
 
 
 router = APIRouter(dependencies=[Depends(verify_bearer)])
@@ -194,58 +199,109 @@ async def stop_task(input_data: StopTaskInput):
     return await task_manager_stop_task(input_data)
 
 
-import base64
-import json
+# @app.post("/v1/chat/completions")
+# async def openai_chat_completions(
+#     request: OpenAIChatCompletionRequest,
+#     raw_request: Request,  # 新增：原始请求对象
+#     user_id: str = Header(None, alias="user-id"),
+#     thread_id: str = Header(None, alias="thread-id"),
+#     x_user_id: str = Header(None, alias="x-user-id"),
+#     x_thread_id: str = Header(None, alias="x-thread-id"),
+#     x_lobe_trace: str = Header(None, alias="x-lobe-trace")
+# ):
+#     """
+#     OpenAI兼容的聊天完成接口
+#
+#     该接口提供与OpenAI API兼容的聊天完成功能，支持流式响应
+#     从请求头获取user_id和thread_id用于数据存储和检索
+#     支持从X-lobe-trace头中提取sessionId作为thread_id
+#
+#     Args:
+#         request (OpenAIChatCompletionRequest): OpenAI格式的聊天完成请求
+#         user_id (str, optional): 用户ID，从请求头获取
+#         thread_id (str, optional): 会话ID，从请求头获取
+#         x_user_id (str, optional): 备用用户ID，从请求头获取
+#         x_thread_id (str, optional): 备用会话ID，从请求头获取
+#
+#     Returns:
+#         Any: OpenAI格式的聊天完成响应
+#     """
+#
+#     logger.info(
+#         "openai_chat_completions headers: user_id=%s thread_id=%s x_user_id=%s x_thread_id=%s x_lobe_trace_len=%s",
+#         user_id,
+#         thread_id,
+#         x_user_id,
+#         x_thread_id,
+#         len(x_lobe_trace) if x_lobe_trace else None,
+#     )
+#     logger.debug("all headers from lobe: %s", dict(raw_request.headers))
+#
+#     import json
+#
+#     # 打印请求体，看看里面有什么
+#     logger.info("request body: %s", json.dumps({
+#         "model": request.model,
+#         "messages_count": len(request.messages) if request.messages else 0,
+#         "user": request.user,
+#         "messages_preview": [
+#             {"role": msg.get("role"), "content_preview": str(msg.get("content", ""))[:50]}
+#             for msg in (request.messages or [])[:3]  # 只打印前3条
+#         ]
+#     }, ensure_ascii=False))
+#
+#     # 优先使用特定头信息，然后是通用头信息
+#     effective_user_id = user_id or x_user_id or None
+#
+#     # 从x-lobe-trace头中提取sessionId作为thread_id
+#     extracted_thread_id = None
+#     if x_lobe_trace:
+#         try:
+#             # 解码base64编码的trace信息
+#             decoded_trace = base64.b64decode(x_lobe_trace).decode('utf-8')
+#             trace_data = json.loads(decoded_trace)
+#             extracted_thread_id = trace_data.get('sessionId')
+#         except Exception:
+#             # 如果解析失败，忽略错误
+#             pass
+#
+#     # 优先级：直接传递的thread_id > 从lobe-trace中提取的sessionId > x_thread_id
+#     effective_thread_id = thread_id or extracted_thread_id or x_thread_id or None
+#
+#     # 将 request.model 作为 agent_id 传递
+#     agent_id = request.model if request.model else None
+#
+#     return await chat_completions_handler(request, agent_id, effective_user_id, effective_thread_id)
 
 
 @app.post("/v1/chat/completions")
-async def openai_chat_completions(
-    request: OpenAIChatCompletionRequest,
-    user_id: str = Header(None, alias="user-id"),
-    thread_id: str = Header(None, alias="thread-id"),
-    x_user_id: str = Header(None, alias="x-user-id"),
-    x_thread_id: str = Header(None, alias="x-thread-id"),
-    x_lobe_trace: str = Header(None, alias="x-lobe-trace")
-):
+async def openai_chat_completions(request: OpenAIChatCompletionRequest,):
     """
     OpenAI兼容的聊天完成接口
-
     该接口提供与OpenAI API兼容的聊天完成功能，支持流式响应
-    从请求头获取user_id和thread_id用于数据存储和检索
-    支持从X-lobe-trace头中提取sessionId作为thread_id
 
     Args:
         request (OpenAIChatCompletionRequest): OpenAI格式的聊天完成请求
-        user_id (str, optional): 用户ID，从请求头获取
-        thread_id (str, optional): 会话ID，从请求头获取
-        x_user_id (str, optional): 备用用户ID，从请求头获取
-        x_thread_id (str, optional): 备用会话ID，从请求头获取
 
     Returns:
         Any: OpenAI格式的聊天完成响应
     """
-    # 优先使用特定头信息，然后是通用头信息
-    effective_user_id = user_id or x_user_id or None
-    
-    # 从x-lobe-trace头中提取sessionId作为thread_id
-    extracted_thread_id = None
-    if x_lobe_trace:
-        try:
-            # 解码base64编码的trace信息
-            decoded_trace = base64.b64decode(x_lobe_trace).decode('utf-8')
-            trace_data = json.loads(decoded_trace)
-            extracted_thread_id = trace_data.get('sessionId')
-        except Exception:
-            # 如果解析失败，忽略错误
-            pass
-    
-    # 优先级：直接传递的thread_id > 从lobe-trace中提取的sessionId > x_thread_id
-    effective_thread_id = thread_id or extracted_thread_id or x_thread_id or None
-    
-    # 将 request.model 作为 agent_id 传递
+    logger.info(f'所有request信息为: {request}')
+
     agent_id = request.model if request.model else None
-    
-    return await chat_completions_handler(request, agent_id, effective_user_id, effective_thread_id)
+    # LobeChat 通过 request.body.user 提供会话 ID
+    thread_id = getattr(request, 'user', None)
+    # user_id 可设为匿名（因 LobeChat 不传真实用户 ID）
+    user_id = "anonymous"  # 或从 auth token 解析（如果你有）
+
+    logger.info("Using thread_id from request.user: %s", thread_id)
+
+    return await chat_completions_handler(
+        request,
+        agent_id=agent_id,
+        user_id=user_id,
+        thread_id=thread_id
+    )
 
 
 app.include_router(router)
