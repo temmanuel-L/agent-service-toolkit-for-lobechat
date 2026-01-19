@@ -17,10 +17,11 @@ from schema.schema import (
     StopTaskOutput,
     OpenAIChatCompletionRequest,
     OpenAIChatCompletionResponse,
-    OpenAIChatCompletionStreamResponse,
-    OpenAIChatMessage,
     OpenAIChoice,
+    OpenAIChatMessage,
+    OpenAIChatCompletionStreamResponse,
     OpenAIStreamChoice,
+    OpenAIChatStreamDelta,
     WebhookPayload,
 )
 
@@ -43,10 +44,11 @@ __all__ = [
     "StopTaskInput",
     "StopTaskOutput",
     "OpenAIChatCompletionRequest",
-    "OpenAIChatCompletionResponse",
-    "OpenAIChatCompletionStreamResponse",
     "OpenAIChatMessage",
     "OpenAIChoice",
+    "OpenAIChatCompletionResponse",
+    "OpenAIChatStreamDelta",
     "OpenAIStreamChoice",
+    "OpenAIChatCompletionStreamResponse",
     "WebhookPayload",
 ]

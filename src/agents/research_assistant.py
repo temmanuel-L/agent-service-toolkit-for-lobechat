@@ -25,7 +25,37 @@ class AgentState(MessagesState, total=False):
     remaining_steps: RemainingSteps
 
 
-web_search = DuckDuckGoSearchResults(name="WebSearch")
+class FormattedDuckDuckGoSearchResults(DuckDuckGoSearchResults):
+    def _run(self, query: str, run_manager=None) -> str:
+        """Use the tool."""
+        # 直接使用 api_wrapper 获取结构化数据，而不是解析字符串
+        try:
+            results = self.api_wrapper.results(query, self.max_results)
+            if not results:
+                return "No results found."
+                
+            formatted_results = []
+            for res in results:
+                title = res.get("title", "No Title")
+                link = res.get("link", "")
+                snippet = res.get("snippet", "")
+                
+                # 构建 Markdown 格式
+                formatted_results.append(f"### [{title}]({link})\n> {snippet}")
+            
+            # 构建 Markdown 格式
+            formatted_res = "\n\n".join(formatted_results)
+            
+            # 兼容 content_and_artifact 格式
+            if getattr(self, "response_format", None) == "content_and_artifact":
+                return formatted_res, results
+                
+            return formatted_res
+        except Exception as e:
+            # 如果出错，回退到默认行为
+            return super()._run(query, run_manager)
+
+web_search = FormattedDuckDuckGoSearchResults(name="WebSearch")
 tools = [web_search, calculator, vector_search_tool]
 
 # Add weather tool if API key is set
@@ -41,7 +71,7 @@ instructions = f"""
     You are a helpful research assistant with the ability to search the web and use other tools.
     Today's date is {current_date}.
 
-    NOTE: THE USER CAN'T SEE THE TOOL RESPONSE.
+    NOTE: THE USER CAN SEE THE TOOL RESPONSE AND EXECUTION STEPS.
 
     A few things to remember:
     - Please include markdown-formatted links to any citations used in your response. Only include one
@@ -146,3 +176,10 @@ agent.add_conditional_edges("model", pending_tool_calls, {"tools": "tools", "don
 
 
 research_assistant = agent.compile()
+
+
+# if __name__ == '__main__':
+#     graph_obj = research_assistant.get_graph()
+#     pic = graph_obj.draw_mermaid_png()
+#     with open('state_graph_research_assistant.png', 'wb') as f:
+#         f.write(pic)

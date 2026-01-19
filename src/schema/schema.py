@@ -334,9 +334,15 @@ class OpenAIChatCompletionResponse(BaseModel):
     usage: dict | None = None
 
 
+class OpenAIChatStreamDelta(BaseModel):
+    role: str | None = None
+    content: str | None = None
+    tool_calls: list[dict] | None = None
+
+
 class OpenAIStreamChoice(BaseModel):
     index: int
-    delta: OpenAIChatMessage
+    delta: OpenAIChatStreamDelta
     finish_reason: str | None = None
 
 
