@@ -1,29 +1,45 @@
 from typing import Optional
+import numexpr
+import math
+import re
 
 from langchain_core.tools import BaseTool, tool
 from pydantic import BaseModel, Field
 
 
-@tool
-def calculator(numexpr: str) -> str:
-    """Useful for getting the result of a math expression. The input to this tool
-    should be a valid mathematical expression that could be evaluated by numexpr."""
-    try:
-        import numexpr  # type: ignore[import-not-found]
-    except ImportError:
-        # Fallback to eval if numexpr is not available
-        # Note: eval is dangerous in production environments
-        try:
-            result = eval(numexpr)  # pylint: disable=eval-used
-        except Exception:  # pylint: disable=broad-exception-caught
-            result = "Error: Invalid expression"
-    else:
-        try:
-            result = numexpr.evaluate(numexpr)
-        except Exception:  # pylint: disable=broad-exception-caught
-            result = "Error: Invalid expression"
+def calculator_func(expression: str) -> str:
+    """Calculates a math expression using numexpr.
 
-    return str(result)
+    Useful for when you need to answer questions about math using numexpr.
+    This tool is only for math questions and nothing else. Only input
+    math expressions.
+
+    Args:
+        expression (str): A valid numexpr formatted math expression.
+
+    Returns:
+        str: The result of the math expression.
+    """
+
+    try:
+        local_dict = {"pi": math.pi, "e": math.e}
+        output = str(
+            numexpr.evaluate(
+                expression.strip(),
+                global_dict={},  # restrict access to globals
+                local_dict=local_dict,  # add common mathematical functions
+            )
+        )
+        return re.sub(r"^\[|\]$", "", output)
+    except Exception as e:
+        raise ValueError(
+            f'calculator("{expression}") raised error: {e}.'
+            " Please try again with a valid numerical expression"
+        )
+
+
+calculator: BaseTool = tool(calculator_func)
+calculator.name = "Calculator"
 
 
 class VectorSearchInput(BaseModel):

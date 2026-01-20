@@ -14,6 +14,7 @@ from agents.langgraph_supervisor_hierarchy_agent import langgraph_supervisor_hie
 from agents.lazy_agent import LazyLoadingAgent
 from agents.rag_assistant import rag_assistant
 from agents.research_assistant import research_assistant
+from agents.simple_travel_planner_agent.simple_travel_planner_agent import simple_travel_planner_agent
 from schema import AgentInfo
 
 DEFAULT_AGENT = "chatbot"
@@ -60,6 +61,10 @@ agents: dict[str, Agent] = {
     "github-mcp-agent": Agent(
         description="A GitHub agent with MCP tools for repository management and development workflows.",
         graph_like=github_mcp_agent,
+    ),
+    "simple-travel-planner": Agent(
+        description="A simple travel planner assistant with structured data gathering.",
+        graph_like=simple_travel_planner_agent,
     ),
 }
 

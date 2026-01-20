@@ -14,6 +14,9 @@ from schema import (OpenAIChatCompletionRequest, StreamInput,
                     OpenAIChatMessage, OpenAIChoice, OpenAIChatCompletionResponse,
                     OpenAIChatStreamDelta, OpenAIStreamChoice, OpenAIChatCompletionStreamResponse)
 from . import handlers as service_handlers
+from utils.log_utils import get_logger
+
+logger = get_logger(__name__)
 
 
 async def chat_completions_handler(
@@ -24,36 +27,21 @@ async def chat_completions_handler(
 ) -> StreamingResponse | OpenAIChatCompletionResponse:
     """
     OpenAI兼容的聊天完成接口处理器
-
-    该函数处理OpenAI格式的请求并返回兼容的响应
-
-    Args:
-        request (OpenAIChatCompletionRequest): OpenAI格式的聊天完成请求
-        agent_id (str): 指定的agent ID
-        user_id (str, optional): 用户ID
-        thread_id (str, optional): 会话ID
-
-    Returns:
-        StreamingResponse: OpenAI格式的流式响应
     """
-    # 将 OpenAI 格式的消息转换为内部格式
     if request.messages:
         last_message = request.messages[-1]
         user_message = last_message.get("content", "")
-        # 使用传入的 user_id，如果未提供则使用默认值
         user_id = user_id or request.user or "default_user"
     else:
         user_message = ""
         user_id = user_id or request.user or "default_user"
 
-    # 创建内部 StreamInput 对象，包含更多 OpenAI 参数
     stream_input = StreamInput(
         message=user_message,
         user_id=user_id,
-        thread_id=thread_id,  # 使用传入的 thread_id
+        thread_id=thread_id,
         model=None,
         stream_tokens=request.stream,
-        # 将 OpenAI 的参数映射到 agent_config 中
         agent_config={
             "temperature": request.temperature,
             "top_p": request.top_p,
@@ -64,119 +52,147 @@ async def chat_completions_handler(
         }
     )
 
-    # 根据是否需要流式响应来调用相应的处理器
     if request.stream:
-        # 对于流式响应，我们需要创建一个特殊的生成器来输出 OpenAI 格式的 SSE
         async def openai_stream_generator():
-            # 调用内部的消息生成器
-            async for chunk in service_handlers.message_generator(stream_input, agent_id):
-                # 检查是否是 SSE 格式的消息
-                if chunk.startswith("data: "):
-                    # 解析内部格式的消息
-                    data_str = chunk[6:].strip()  # 移除 "data: " 前缀
-                    if data_str == "[DONE]":
-                        # 发送 OpenAI 格式的完成消息
-                        # 添加 finish_reason 来表示完成
-                        finish_chunk = {
-                            "id": f"chatcmpl-{uuid.uuid4()}",
-                            "object": "chat.completion.chunk",
-                            "created": int(time.time()),
-                            "model": request.model or (agent_id or "default-model"),
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {},
-                                    "finish_reason": "stop"
-                                }
-                            ]
-                        }
-                        yield f"data: {json.dumps(finish_chunk, ensure_ascii=False)}\n\n"
-                        yield f"data: [DONE]\n\n"
-                    else:
-                        try:
-                            internal_data = json.loads(data_str)
-                            if internal_data["type"] == "message":
-                                chat_msg = internal_data["content"]
-                                delta = {}
-                                
-                                # 确定角色
-                                if chat_msg["type"] == "ai":
-                                    delta["role"] = "assistant"
-                                elif chat_msg["type"] == "tool":
-                                    delta["role"] = "tool"
-                                    delta["tool_call_id"] = chat_msg.get("tool_call_id")
-                                
-                                # 处理内容 (避免 AI 消息重复推送)
-                                content = chat_msg.get("content")
-                                if content:
-                                    # 如果是流式模式下的 AI 消息，内容通常已经通过 'token' 事件发送过了，所以这里跳过
-                                    # 但对于 tool 类型消息（工具执行结果），我们需要发送内容
-                                    if chat_msg["type"] == "tool":
-                                        delta["content"] = content
-                                    elif chat_msg["type"] == "ai" and not request.stream:
-                                        delta["content"] = content
+            role_sent = False
+            # 记录当前 AI 消息已经发送的 token 数量
+            tokens_sent_for_current_msg = 0
+            # 为整个流生成统一的 ID
+            request_id = f"chatcmpl-{uuid.uuid4()}"
 
-                                # 处理工具调用 (Tool Calls)
-                                if chat_msg.get("tool_calls"):
-                                    delta["tool_calls"] = [
-                                        {
-                                            "index": i,
-                                            "id": tc["id"],
-                                            "type": "function",
-                                            "function": {
-                                                "name": tc["name"],
-                                                "arguments": json.dumps(tc["args"], ensure_ascii=False)
-                                            }
-                                        } for i, tc in enumerate(chat_msg["tool_calls"])
-                                    ]
+            logger.info(f"开启 OpenAI 兼容流式响应: agent={agent_id}, thread={thread_id}")
+
+            async for chunk in service_handlers.message_generator(stream_input, agent_id):
+                if not chunk.startswith("data: "):
+                    continue
+
+                data_str = chunk[6:].strip()
+                if data_str == "[DONE]":
+                    logger.debug("接收到内部 [DONE] 信号")
+                    finish_chunk = {
+                        "id": f"chatcmpl-{uuid.uuid4()}",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": request.model or (agent_id or "default-model"),
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                    }
+                    yield f"data: {json.dumps(finish_chunk, ensure_ascii=False)}\n\n"
+                    yield f"data: [DONE]\n\n"
+                    continue
+
+                try:
+                    internal_data = json.loads(data_str)
+                    data_type = internal_data.get("type")
+                    
+                    # 1. 处理令牌 (Tokens)
+                    if data_type == "token":
+                        content = internal_data.get("content")
+                        if not content or content == "None":
+                            continue
+
+                        delta = {"content": content}
+                        if not role_sent:
+                            delta["role"] = "assistant"
+                            role_sent = True
+                        
+                        # 计数已发送的字符数
+                        tokens_sent_for_current_msg += len(content)
+                        
+                        openai_chunk = OpenAIChatCompletionStreamResponse(
+                            id=request_id,
+                            created=int(time.time()),
+                            model=request.model or (agent_id or "default-model"),
+                            choices=[OpenAIStreamChoice(index=0, delta=OpenAIChatStreamDelta(**delta), finish_reason=None)]
+                        )
+                        # Pydantic model_dump_json doesn't support ensure_ascii in some versions
+                        # Use model_dump then json.dumps for maximum compatibility
+                        json_data = json.dumps(openai_chunk.model_dump(exclude_none=True), ensure_ascii=False)
+                        yield f"data: {json_data}\n\n"
+
+                    elif data_type == "message":
+                        chat_msg = internal_data.get("content", {})
+                        msg_type = chat_msg.get("type")
+                        delta_dict = {}
+                        
+                        if msg_type == "ai":
+                            content = chat_msg.get("content", "")
+                            logger.info(f"适配器收到 AI 消息事件: len={len(content)}, tokens_sent={tokens_sent_for_current_msg}")
+                            
+                            # 只有当有新内容需要补发时才发送
+                            # 如果 tokens_sent_for_current_msg 等于 content 长度，说明已经完全发送过了
+                            if content and len(content) > tokens_sent_for_current_msg:
+                                remaining_content = content[tokens_sent_for_current_msg:]
                                 
-                                if delta:
+                                # 额外检查：如果剩余内容非空才发送
+                                if remaining_content.strip():
+                                    logger.info(f"补发 AI 剩余内容: {remaining_content[:50]}... (剩余长度: {len(remaining_content)})")
+                                    
+                                    delta_dict = {"content": remaining_content}
+                                    if not role_sent:
+                                        delta_dict["role"] = "assistant"
+                                        role_sent = True
+                                        
                                     openai_chunk = OpenAIChatCompletionStreamResponse(
-                                        id=f"chatcmpl-{uuid.uuid4()}",
+                                        id=request_id,
                                         created=int(time.time()),
                                         model=request.model or (agent_id or "default-model"),
                                         choices=[
                                             OpenAIStreamChoice(
                                                 index=0,
-                                                delta=OpenAIChatStreamDelta(**delta),
+                                                delta=OpenAIChatStreamDelta(**delta_dict),
                                                 finish_reason=None
                                             )
                                         ]
                                     )
-                                    yield f"data: {openai_chunk.model_dump_json(exclude_none=True)}\n\n"
+                                    json_data = json.dumps(openai_chunk.model_dump(exclude_none=True), ensure_ascii=False)
+                                    yield f"data: {json_data}\n\n"
+                            
+                            # 重置计数器，为下一条消息做准备
+                            tokens_sent_for_current_msg = 0
+                            continue
+                        
+                        elif msg_type == "tool":
+                            logger.info(f"发送工具返回内容: {chat_msg.get('tool_call_id')}")
+                            delta_dict["role"] = "tool"
+                            delta_dict["tool_call_id"] = chat_msg.get("tool_call_id")
+                            delta_dict["content"] = chat_msg.get("content", "")
 
-                            elif internal_data["type"] == "error":
-                                # 处理来自 service handler 的显式错误
-                                error_content = internal_data["content"]
-                                yield f"data: {json.dumps({'error': {'message': error_content, 'type': 'internal_server_error', 'code': 500}}, ensure_ascii=False)}\n\n"
+                        # 处理工具调用 (Tool Calls)
+                        tool_calls = chat_msg.get("tool_calls")
+                        if tool_calls:
+                            logger.info(f"发送工具调用请求: {[tc['name'] for tc in tool_calls]}")
+                            delta_dict["tool_calls"] = [
+                                {
+                                    "id": tc.get("id"),
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc.get("name"),
+                                        "arguments": json.dumps(tc.get("args"))
+                                    }
+                                } for tc in tool_calls
+                            ]
+                        
+                        if not delta_dict:
+                            continue
+                            
+                        openai_chunk = OpenAIChatCompletionStreamResponse(
+                            id=request_id,
+                            created=int(time.time()),
+                            model=request.model or (agent_id or "default-model"),
+                            choices=[OpenAIStreamChoice(index=0, delta=OpenAIChatStreamDelta(**delta_dict), finish_reason=None)]
+                        )
+                        json_data = json.dumps(openai_chunk.model_dump(exclude_none=True), ensure_ascii=False)
+                        yield f"data: {json_data}\n\n"
+                    elif data_type == "error":
+                        logger.error(f"内部生成器错误: {internal_data.get('content')}")
+                        yield f"data: {json.dumps({'error': {'message': internal_data['content'], 'type': 'internal_server_error', 'code': 500}}, ensure_ascii=False)}\n\n"
 
-                            elif internal_data["type"] == "token":
-                                content = internal_data["content"]
-                                # 转换为 OpenAI 格式
-                                openai_chunk = OpenAIChatCompletionStreamResponse(
-                                    id=f"chatcmpl-{uuid.uuid4()}",
-                                    created=int(time.time()),
-                                    model=request.model or (agent_id or "default-model"),
-                                    choices=[
-                                        OpenAIStreamChoice(
-                                            index=0,
-                                            delta=OpenAIChatStreamDelta(content=content),
-                                            finish_reason=None
-                                        )
-                                    ]
-                                )
-                                yield f"data: {openai_chunk.model_dump_json(exclude_none=True)}\n\n"
-                        except json.JSONDecodeError:
-                            # 如果解析失败，直接传递原始数据
-                            yield chunk
-                        except Exception as e:
-                            # 处理其他错误
-                            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+                except Exception as e:
+                    logger.error(f"OpenAI 适配层处理块出错: {e}")
 
         return StreamingResponse(openai_stream_generator(), media_type="text/event-stream")
     else:
         result = await service_handlers.invoke_handler(stream_input, agent_id)
-        # 这里需要将结果转换为 OpenAI 格式
         response = OpenAIChatCompletionResponse(
             id=f"chatcmpl-{uuid.uuid4()}",
             created=int(time.time()),
@@ -184,10 +200,7 @@ async def chat_completions_handler(
             choices=[
                 OpenAIChoice(
                     index=0,
-                    message=OpenAIChatMessage(
-                        role="assistant",
-                        content=result.content
-                    ),
+                    message=OpenAIChatMessage(role="assistant", content=result.content),
                     finish_reason="stop"
                 )
             ]

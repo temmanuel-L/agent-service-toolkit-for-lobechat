@@ -26,7 +26,7 @@ class AgentState(MessagesState, total=False):
 
 
 class FormattedDuckDuckGoSearchResults(DuckDuckGoSearchResults):
-    def _run(self, query: str, run_manager=None) -> str:
+    def _run(self, query: str, run_manager=None) -> str | tuple:
         """Use the tool."""
         # 直接使用 api_wrapper 获取结构化数据，而不是解析字符串
         try:
@@ -46,7 +46,7 @@ class FormattedDuckDuckGoSearchResults(DuckDuckGoSearchResults):
             # 构建 Markdown 格式
             formatted_res = "\n\n".join(formatted_results)
             
-            # 兼容 content_and_artifact 格式
+            # 兼容 content_and_artifact 格式(lobe-chat)
             if getattr(self, "response_format", None) == "content_and_artifact":
                 return formatted_res, results
                 

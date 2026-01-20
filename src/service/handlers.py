@@ -182,8 +182,9 @@ async def message_generator(
     """
     流式生成聊天消息响应
 
-    该函数通过异步流的方式从agent图中获取响应，并将其格式化为SSE(Server-Sent Events)格式返回
-    它支持处理中断、任务取消、消息过滤等功能，能够实时地将响应发送给客户端
+    该函数通过异步流的方式从agent图中获取响应，并其格式化为SSE(Server-Sent Events)格式返回
+    它支持处理中断、任务取消、消息过滤等功能，能够实时地响应发送给客户端
+    可选地使用 RAG 知识库增强回答
 
     Args:
         user_input (StreamInput): 用户输入对象，包含消息内容、线程ID、用户ID等信息以及流控制选项
@@ -197,11 +198,12 @@ async def message_generator(
     """
     agent: AgentGraph = get_agent(agent_id)
     kwargs, run_id, task_id = await _handle_input(user_input, agent)
-    # 注册 task event
+    #  注册 task event
     cancel_event = register_active_task(task_id)
+
     full_response = ""
     try:
-        # 从图中处理流式事件并通过SSE流将消息发送给客户端
+        # 从图中处理流式事件并通过SSE流消息发送给客户端
         async for stream_event in agent.astream(
             **kwargs, stream_mode=["updates", "messages", "custom"], subgraphs=True
         ):
@@ -216,10 +218,12 @@ async def message_generator(
             # 根据是否使用子图处理不同的流事件结构
             if len(stream_event) == 3:
                 # 使用subgraphs=True时: (node_path, stream_mode, event)
-                _, stream_mode, event = stream_event
+                node_path, stream_mode, event = stream_event
+                # Removed verbose logging: logger.debug(f"LangGraph事件 [SUB]: node={node_path}, mode={stream_mode}")
             else:
                 # 不使用subgraphs时: (stream_mode, event)
                 stream_mode, event = stream_event
+                # Removed verbose logging: logger.debug(f"LangGraph事件 [TOP]: mode={stream_mode}")
             new_messages = []
             # 处理updates类型的流事件，主要包含节点更新信息
             if stream_mode == "updates":
@@ -227,9 +231,9 @@ async def message_generator(
                     # 处理agent中断的简单方法
                     # 在更复杂的实现中，我们可以添加一些结构化的ChatMessage类型来返回中断值
                     if node == "__interrupt__":
-                        interrupt: Interrupt
-                        for interrupt in updates:
-                            new_messages.append(AIMessage(content=interrupt.value))
+                        interrupt_val: Interrupt
+                        for interrupt_val in updates:
+                            new_messages.append(AIMessage(content=interrupt_val.value))
                         continue
                     updates = updates or {}
                     update_messages = updates.get("messages", [])
@@ -247,7 +251,7 @@ async def message_generator(
                             update_messages = []
                     new_messages.extend(update_messages)
 
-            # 处理custom类型的流事件，直接将事件作为消息
+            # 处理custom类型的流事件，直接事件作为消息
             if stream_mode == "custom":
                 new_messages = [event]
 
@@ -260,13 +264,20 @@ async def message_generator(
             for message in new_messages:
                 if isinstance(message, tuple):
                     key, value = message
-                    # 将部分存储在临时字典中
                     current_message[key] = value
                 else:
-                    # 如果有正在进行的消息则添加完整消息
+                    # 首先处理累积的部分消息
                     if current_message:
                         processed_messages.append(_create_ai_message(current_message))
                         current_message = {}
+                    
+                    # 核心去重逻辑：避免发送与已发送内容完全一致的消息
+                    if isinstance(message, AIMessage):
+                        msg_content = convert_message_content_to_string(message.content)
+                        if msg_content and full_response.endswith(msg_content):
+                             logger.info(f"忽略重复的 AI 消息内容: {msg_content[:30]}...")
+                             continue
+                    
                     processed_messages.append(message)
 
             # 添加任何剩余的消息部分
@@ -282,9 +293,17 @@ async def message_generator(
                     logger.error(f"解析消息时出错: {e}")
                     yield f"data: {json.dumps({'type': 'error', 'content': '意外错误'})}\n\n"
                     continue
+                
+                logger.debug(f"准备发送消息: type={chat_message.type}, content_len={len(chat_message.content) if chat_message.content else 0}, skip={chat_message.response_metadata.get('skip_stream')}")
+                
                 # LangGraph重新发送输入消息，这感觉很奇怪，所以丢弃它
-                if chat_message.type == "human" and chat_message.content == user_input.message:
+                if chat_message.type == "human" and (chat_message.content or "").strip() == (user_input.message or "").strip():
                     continue
+                
+                # 保留我的逻辑：如果标记了跳过流式传输，则不发送
+                if chat_message.response_metadata.get("skip_stream"):
+                    continue
+                
                 yield f"data: {json.dumps({'type': 'message', 'content': chat_message.model_dump()})}\n\n"
 
             # 处理messages类型的流事件，主要用于流式传输LLM生成的令牌
@@ -292,11 +311,16 @@ async def message_generator(
                 if not user_input.stream_tokens:
                     continue
                 msg, metadata = event
+                
+                # 核心修复：不但要检查 metadata（来自节点/运行），还要检查消息本身的对象属性
+                # 这能过滤掉那种从节点返回、带 skip_stream 标记的静态 AIMessage
                 if "skip_stream" in metadata.get("tags", []):
                     continue
-                # 出于某种原因，astream("messages")会导致非LLM节点发送额外消息
-                # 丢弃它们
-                if not isinstance(msg, AIMessageChunk):
+                if hasattr(msg, "response_metadata") and msg.response_metadata.get("skip_stream"):
+                    continue
+                    
+                # 按照用户给出的原始代码，这里保留对 AIMessage 或 AIMessageChunk 的支持
+                if not isinstance(msg, (AIMessageChunk, AIMessage)):
                     continue
                 content = remove_tool_calls(msg.content)
                 if content:
@@ -304,12 +328,13 @@ async def message_generator(
                     full_response += token_content
                     # 在OpenAI的上下文中，空内容通常意味着模型要求调用工具
                     # 所以我们只打印非空内容
-                    yield f"data: {json.dumps({'type': 'token', 'content': token_content})}\n\n"
+                    yield f"data: {json.dumps({'type': 'token', 'content': token_content}, ensure_ascii=False)}\n\n"
     except Exception as e:
         logger.error(f"消息生成器中发生错误: {e}")
         yield f"data: {json.dumps({'type': 'error', 'content': '内部服务器错误'})}\n\n"
     finally:
         unregister_active_task(task_id)
+        # Note: 按照用户建议，在这里不做过多逻辑，只保留原始 stable 结构
         yield "data: [DONE]\n\n"
 
 
