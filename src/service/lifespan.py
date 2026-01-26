@@ -11,7 +11,8 @@ from agents import get_agent, get_all_agent_info, load_agent
 from memory import initialize_database, initialize_store
 from memory.qdrant import get_qdrant_client
 from memory.vector_manager import VectorManager
-from core import get_embedding_model
+from core import get_embedding_model, settings
+from langfuse import Langfuse
 from .service import cleanup_manager
 from utils.log_utils import get_logger
 
@@ -235,6 +236,18 @@ async def lifespan(app) -> AsyncGenerator[None, None]:
             await vector_manager.ainitialize()
             # 将向量管理器存储在应用状态中，以便在处理请求时使用
             app.state.vector_manager = vector_manager
+            
+            # --- 新增：初始化全局 Langfuse 客户端 ---
+            if settings.LANGFUSE_TRACING:
+                try:
+                    Langfuse(
+                        public_key=settings.LANGFUSE_PUBLIC_KEY.get_secret_value() if settings.LANGFUSE_PUBLIC_KEY else None,
+                        secret_key=settings.LANGFUSE_SECRET_KEY.get_secret_value() if settings.LANGFUSE_SECRET_KEY else None,
+                        host=settings.LANGFUSE_HOST
+                    )
+                    logger.info("Langfuse 全局客户端初始化成功")
+                except Exception as e:
+                    logger.error(f"Langfuse 初始化失败: {e}")
             
             yield
         except Exception as exc:

@@ -11,6 +11,7 @@ from fastapi import HTTPException, status
 from fastapi.responses import StreamingResponse
 from langchain_core.messages import AIMessage, AIMessageChunk, SystemMessage,HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
+from langfuse import Langfuse
 from langfuse.langchain import CallbackHandler
 from langgraph.types import Command, Interrupt
 from langsmith import Client as LangsmithClient
@@ -71,12 +72,8 @@ async def _handle_input(
     callbacks = []
     # 如果启用了Langfuse跟踪，则添加Langfuse回调处理器
     if settings.LANGFUSE_TRACING:
-        # Langfuse 回调配置
-        langfuse_handler = CallbackHandler(
-            public_key=settings.LANGFUSE_PUBLIC_KEY.get_secret_value() if settings.LANGFUSE_PUBLIC_KEY else None,
-            secret_key=settings.LANGFUSE_SECRET_KEY.get_secret_value() if settings.LANGFUSE_SECRET_KEY else None,
-            host=settings.LANGFUSE_HOST
-        )
+        # Langfuse 回调配置 (全局客户端已在 lifespan.py 中初始化)
+        langfuse_handler = CallbackHandler()
 
         callbacks.append(langfuse_handler)
 
@@ -274,8 +271,9 @@ async def message_generator(
                     # 核心去重逻辑：避免发送与已发送内容完全一致的消息
                     if isinstance(message, AIMessage):
                         msg_content = convert_message_content_to_string(message.content)
-                        if msg_content and full_response.endswith(msg_content):
-                             logger.info(f"忽略重复的 AI 消息内容: {msg_content[:30]}...")
+                        # 优化：通过 strip() 处理可能存在的空格或换行符差异
+                        if msg_content and full_response.strip().endswith(msg_content.strip()):
+                             logger.info(f"忽略重复的 AI 消息内容 (精确匹配): {msg_content[:30]}...")
                              continue
                     
                     processed_messages.append(message)
@@ -325,6 +323,12 @@ async def message_generator(
                 content = remove_tool_calls(msg.content)
                 if content:
                     token_content = convert_message_content_to_string(content)
+                    
+                    # --- 方案补漏：防止消息从 messages 车道偷跑 ---
+                    # 即使是在 token 级流中，如果收到的内容已经完全发过了，也要拦住
+                    if full_response and full_response.strip().endswith(token_content.strip()):
+                        continue
+                        
                     full_response += token_content
                     # 在OpenAI的上下文中，空内容通常意味着模型要求调用工具
                     # 所以我们只打印非空内容
