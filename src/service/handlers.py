@@ -198,7 +198,9 @@ async def message_generator(
     #  注册 task event
     cancel_event = register_active_task(task_id)
 
+    # 共享账本：记录已发出的全部 AI 文本内容，用于多通道去重
     full_response = ""
+
     try:
         # 从图中处理流式事件并通过SSE流消息发送给客户端
         async for stream_event in agent.astream(
@@ -210,6 +212,7 @@ async def message_generator(
                 stop_message = _build_stop_chat_message(run_id, "当前对话已被用户手动停止")
                 yield f"data: {json.dumps({'type': 'message', 'content': stop_message.model_dump()})}\n\n"
                 break
+
             if not isinstance(stream_event, tuple):
                 continue
             # 根据是否使用子图处理不同的流事件结构
@@ -228,16 +231,17 @@ async def message_generator(
                     # 处理agent中断的简单方法
                     # 在更复杂的实现中，我们可以添加一些结构化的ChatMessage类型来返回中断值
                     if node == "__interrupt__":
-                        interrupt_val: Interrupt
-                        for interrupt_val in updates:
-                            new_messages.append(AIMessage(content=interrupt_val.value))
+                        for interrupt in updates:
+                            # 中断内容通常为非流式静态文本，需记录至账本同步
+                            val = interrupt.value if hasattr(interrupt, 'value') else str(interrupt)
+                            new_messages.append(AIMessage(content=val))
                         continue
                     updates = updates or {}
                     update_messages = updates.get("messages", [])
                     # 使用langgraph-supervisor库的特殊情况
                     if "supervisor" in node or "sub-agent" in node:
-                        # 来自实际agent的唯二工具是handoff和handback工具
-                        if isinstance(update_messages[-1], ToolMessage):
+                        # if isinstance(update_messages[-1], ToolMessage):
+                        if isinstance(update_messages[-1] if update_messages else None, ToolMessage):
                             if "sub-agent" in node and len(update_messages) > 1:
                                 # 如果这是子agent，我们希望保留最后2条消息 - handback工具及其结果
                                 update_messages = update_messages[-2:]
@@ -267,15 +271,6 @@ async def message_generator(
                     if current_message:
                         processed_messages.append(_create_ai_message(current_message))
                         current_message = {}
-                    
-                    # 核心去重逻辑：避免发送与已发送内容完全一致的消息
-                    if isinstance(message, AIMessage):
-                        msg_content = convert_message_content_to_string(message.content)
-                        # 优化：通过 strip() 处理可能存在的空格或换行符差异
-                        if msg_content and full_response.strip().endswith(msg_content.strip()):
-                             logger.info(f"忽略重复的 AI 消息内容 (精确匹配): {msg_content[:30]}...")
-                             continue
-                    
                     processed_messages.append(message)
 
             # 添加任何剩余的消息部分
@@ -291,51 +286,57 @@ async def message_generator(
                     logger.error(f"解析消息时出错: {e}")
                     yield f"data: {json.dumps({'type': 'error', 'content': '意外错误'})}\n\n"
                     continue
+
+                logger.debug(f"准备发送消息: type={chat_message.type}, content_len={len(chat_message.content) if chat_message.content else 0}")
                 
-                logger.debug(f"准备发送消息: type={chat_message.type}, content_len={len(chat_message.content) if chat_message.content else 0}, skip={chat_message.response_metadata.get('skip_stream')}")
-                
-                # LangGraph重新发送输入消息，这感觉很奇怪，所以丢弃它
                 if chat_message.type == "human" and (chat_message.content or "").strip() == (user_input.message or "").strip():
                     continue
                 
-                # 保留我的逻辑：如果标记了跳过流式传输，则不发送
+                # 保留逻辑：如果标记了跳过流式传输，则不发送
                 if chat_message.response_metadata.get("skip_stream"):
                     continue
-                
+                # --- 去重判定 (Last Lifeline Logic) ---
+                if chat_message.type == "ai" and not chat_message.tool_calls:
+                    content = chat_message.content or ""
+                    # 如果内容已部分或全部通过 messages 通道(token)发过了，则此块忽略
+                    if content.strip() and content.strip() in full_response:
+                        continue
+                    # 如果是新内容（如中断提示），正常发送并更新账本
+                    full_response += content
+
                 yield f"data: {json.dumps({'type': 'message', 'content': chat_message.model_dump()})}\n\n"
 
-            # 处理messages类型的流事件，主要用于流式传输LLM生成的令牌
+            # 2. Token 流式分发 (Messages)
             if stream_mode == "messages":
                 if not user_input.stream_tokens:
                     continue
                 msg, metadata = event
                 
-                # 核心修复：不但要检查 metadata（来自节点/运行），还要检查消息本身的对象属性
-                # 这能过滤掉那种从节点返回、带 skip_stream 标记的静态 AIMessage
+                # 核心修复：检查 metadata 和消息本身的 skip 标记
                 if "skip_stream" in metadata.get("tags", []):
                     continue
                 if hasattr(msg, "response_metadata") and msg.response_metadata.get("skip_stream"):
                     continue
                     
-                # 按照用户给出的原始代码，这里保留对 AIMessage 或 AIMessageChunk 的支持
                 if not isinstance(msg, (AIMessageChunk, AIMessage)):
                     continue
+                
                 content = remove_tool_calls(msg.content)
                 if content:
-                    token_content = convert_message_content_to_string(content)
+                    chunk_str = convert_message_content_to_string(content)
                     
-                    # --- 方案补漏：防止消息从 messages 车道偷跑 ---
-                    # 即使是在 token 级流中，如果收到的内容已经完全发过了，也要拦住
-                    if full_response and full_response.strip().endswith(token_content.strip()):
-                        continue
-                        
-                    full_response += token_content
-                    # 在OpenAI的上下文中，空内容通常意味着模型要求调用工具
-                    # 所以我们只打印非空内容
-                    yield f"data: {json.dumps({'type': 'token', 'content': token_content}, ensure_ascii=False)}\n\n"
+                    # 增量提取：处理累积流 (A -> AB -> ABC)
+                    if full_response and chunk_str.startswith(full_response):
+                        delta = chunk_str[len(full_response):]
+                    else:
+                        delta = chunk_str
+                    
+                    if delta:
+                        full_response += delta
+                        yield f"data: {json.dumps({'type': 'token', 'content': delta}, ensure_ascii=False)}\n\n"
     except Exception as e:
-        logger.error(f"消息生成器中发生错误: {e}")
-        yield f"data: {json.dumps({'type': 'error', 'content': '内部服务器错误'})}\n\n"
+        logger.error(f"生成器崩溃: {e}", exc_info=True)
+        yield f"data: {json.dumps({'type': 'error', 'content': 'Internal server error'})}\n\n"
     finally:
         unregister_active_task(task_id)
         # Note: 按照用户建议，在这里不做过多逻辑，只保留原始 stable 结构
