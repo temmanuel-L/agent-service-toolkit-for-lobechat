@@ -98,7 +98,7 @@ class OpenRouterModelName(StrEnum):
 class OpenAICompatibleName(StrEnum):
     """https://platform.openai.com/docs/guides/text-generation"""
 
-    OPENAI_COMPATIBLE = "openai-compatible"
+    GPT_4O_MINI = "gpt-4o-mini"
 
 
 class FakeModelName(StrEnum):

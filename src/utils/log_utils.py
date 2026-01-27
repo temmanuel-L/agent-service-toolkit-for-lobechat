@@ -34,11 +34,13 @@ class Logger:
         logging.root.setLevel(logging.NOTSET)
 
         self.log_path = path
-        self.log_file_name = "imulation-intelligent-assistant.log"  # 日志文件
+        self.log_file_name = "agent_local.log"  # 日志文件
         self.backup_count = 14  # 保留的日志数量
         # 日志输出级别
         self.console_output_level = _log_level
         self.file_output_level = _log_level
+        # 设置 logger 自身的级别，否则 INFO 级别的日志可能被默认的 WARNING 级别过滤掉
+        self._logger.setLevel(self.console_output_level)
         # 日志输出格式
         pattern = "%(asctime)s - %(filename)s [Line:%(lineno)d] - %(levelname)s - %(message)s"
         self.formatter = logging.Formatter(pattern)

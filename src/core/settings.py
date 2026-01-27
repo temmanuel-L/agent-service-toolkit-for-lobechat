@@ -63,6 +63,20 @@ def check_str_is_http(x: str) -> str:
     return str(http_url_adapter.validate_python(x))
 
 
+def is_ollama_reachable(base_url: str | None) -> bool:
+    """Check if the Ollama server is reachable and functional."""
+    if not base_url:
+        return False
+    try:
+        import httpx
+        # 尝试调用 Ollama 的 tags 接口，确认服务不仅端口通，而且能响应请求
+        # 使用较短的超时时间，避免阻塞启动
+        response = httpx.get(f"{base_url.rstrip('/')}/api/tags", timeout=1.0)
+        return response.status_code == 200
+    except Exception:
+        return False
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=find_dotenv(),
@@ -167,15 +181,15 @@ class Settings(BaseSettings):
 
     def model_post_init(self, __context: Any) -> None:
         api_keys = {
+            Provider.OLLAMA: self.OLLAMA_MODEL and is_ollama_reachable(self.OLLAMA_BASE_URL),
+            Provider.OPENAI_COMPATIBLE: (self.COMPATIBLE_BASE_URL and self.COMPATIBLE_MODEL) or self.DMX_CHAT_URL,
             Provider.OPENAI: self.OPENAI_API_KEY,
-            Provider.OPENAI_COMPATIBLE: self.COMPATIBLE_BASE_URL and self.COMPATIBLE_MODEL,
             Provider.DEEPSEEK: self.DEEPSEEK_API_KEY,
             Provider.ANTHROPIC: self.ANTHROPIC_API_KEY,
             Provider.GOOGLE: self.GOOGLE_API_KEY,
             Provider.VERTEXAI: self.GOOGLE_APPLICATION_CREDENTIALS,
             Provider.GROQ: self.GROQ_API_KEY,
             Provider.AWS: self.USE_AWS_BEDROCK,
-            Provider.OLLAMA: self.OLLAMA_MODEL,
             Provider.FAKE: self.USE_FAKE_MODEL,
             Provider.AZURE_OPENAI: self.AZURE_OPENAI_API_KEY,
             Provider.OPENROUTER: self.OPENROUTER_API_KEY,
@@ -186,14 +200,18 @@ class Settings(BaseSettings):
 
         for provider in active_keys:
             match provider:
+                case Provider.OLLAMA:
+                    if self.DEFAULT_MODEL is None:
+                        self.DEFAULT_MODEL = OllamaModelName.OLLAMA_GENERIC
+                    self.AVAILABLE_MODELS.update(set(OllamaModelName))
+                case Provider.OPENAI_COMPATIBLE:
+                    if self.DEFAULT_MODEL is None:
+                        self.DEFAULT_MODEL = OpenAICompatibleName.GPT_4O_MINI
+                    self.AVAILABLE_MODELS.update(set(OpenAICompatibleName))
                 case Provider.OPENAI:
                     if self.DEFAULT_MODEL is None:
                         self.DEFAULT_MODEL = OpenAIModelName.GPT_5_NANO
                     self.AVAILABLE_MODELS.update(set(OpenAIModelName))
-                case Provider.OPENAI_COMPATIBLE:
-                    if self.DEFAULT_MODEL is None:
-                        self.DEFAULT_MODEL = OpenAICompatibleName.OPENAI_COMPATIBLE
-                    self.AVAILABLE_MODELS.update(set(OpenAICompatibleName))
                 case Provider.DEEPSEEK:
                     if self.DEFAULT_MODEL is None:
                         self.DEFAULT_MODEL = DeepseekModelName.DEEPSEEK_CHAT
@@ -218,10 +236,6 @@ class Settings(BaseSettings):
                     if self.DEFAULT_MODEL is None:
                         self.DEFAULT_MODEL = AWSModelName.BEDROCK_HAIKU
                     self.AVAILABLE_MODELS.update(set(AWSModelName))
-                case Provider.OLLAMA:
-                    if self.DEFAULT_MODEL is None:
-                        self.DEFAULT_MODEL = OllamaModelName.OLLAMA_GENERIC
-                    self.AVAILABLE_MODELS.update(set(OllamaModelName))
                 case Provider.OPENROUTER:
                     if self.DEFAULT_MODEL is None:
                         self.DEFAULT_MODEL = OpenRouterModelName.GEMINI_25_FLASH

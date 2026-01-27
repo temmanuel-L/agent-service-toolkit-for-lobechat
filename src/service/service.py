@@ -20,6 +20,7 @@ class CleanupManager:
     
     def __init__(self):
         self.saver = None  # 用于数据库清理
+        self.vector_manager = None  # 用于向量数据清理
         self._is_running = False
         self.cleanup_task = None
 
@@ -69,12 +70,15 @@ class CleanupManager:
         清理过期的向量数据
         """
         try:
-            # 使用VectorManager清理过期数据
-            vector_manager = VectorManager()
-            await vector_manager.ainitialize()
+            # 如果已有共享的 vector_manager，则直接使用，避免重复初始化
+            vm = self.vector_manager
+            if not vm:
+                vm = VectorManager()
+                await vm.ainitialize()
             
             # 获取过期的用户/会话数据并清理
-            # 这里可以根据实际需求实现具体的清理逻辑
+            # 这里的清理逻辑已经在 VectorManager.acleanup_expired_data 中实现
+            # 如果需要批量清理所有 agent，可以在此扩展
             logger.info("清理过期向量数据完成")
         except Exception as e:
             logger.error(f"清理过期向量数据时发生错误: {e}")

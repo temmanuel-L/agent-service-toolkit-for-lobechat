@@ -10,6 +10,7 @@ from langchain_groq import ChatGroq
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_openai import AzureChatOpenAI, ChatOpenAI
 
+from utils.log_utils import get_logger
 from core.settings import settings
 from schema.models import (
     AllModelEnum,
@@ -26,6 +27,8 @@ from schema.models import (
     OpenRouterModelName,
     VertexAIModelName,
 )
+
+logger = get_logger(__name__)
 
 _MODEL_TABLE = (
     {m: m.value for m in OpenAIModelName}
@@ -75,21 +78,24 @@ def get_model(model_name: AllModelEnum, /) -> ModelT:
     # NOTE: models with streaming=True will send tokens as they are generated
     # if the /stream endpoint is called with stream_tokens=True (the default)
     api_model_name = _MODEL_TABLE.get(model_name)
+    logger.info(f'api_model_name: {api_model_name}')
     if not api_model_name:
         raise ValueError(f"Unsupported model: {model_name}")
 
     if model_name in OpenAIModelName:
         return ChatOpenAI(model=api_model_name, streaming=True)
     if model_name in OpenAICompatibleName:
-        if not settings.COMPATIBLE_BASE_URL or not settings.COMPATIBLE_MODEL:
-            raise ValueError("OpenAICompatible base url and endpoint must be configured")
-
+        # Check for both explicit compatible settings and DMX proxy settings
+        if not settings.COMPATIBLE_BASE_URL and not settings.DMX_CHAT_URL:
+            logger.error("OpenAICompatible provider is active but missing required base_url configuration.")
+            raise ValueError("OpenAICompatible provider is active but missing required base_url configuration.")
+        
         return ChatOpenAI(
-            model=settings.COMPATIBLE_MODEL,
+            model=settings.COMPATIBLE_MODEL or api_model_name,
             temperature=0.5,
             streaming=True,
-            openai_api_base=settings.COMPATIBLE_BASE_URL,
-            openai_api_key=settings.COMPATIBLE_API_KEY,
+            base_url=settings.COMPATIBLE_BASE_URL or settings.DMX_CHAT_URL,
+            api_key=settings.COMPATIBLE_API_KEY or (settings.OPENAI_API_KEY.get_secret_value() if settings.OPENAI_API_KEY else None),
         )
     if model_name in AzureOpenAIModelName:
         if not settings.AZURE_OPENAI_API_KEY or not settings.AZURE_OPENAI_ENDPOINT:
@@ -125,13 +131,29 @@ def get_model(model_name: AllModelEnum, /) -> ModelT:
     if model_name in AWSModelName:
         return ChatBedrock(model_id=api_model_name, temperature=0.5)
     if model_name in OllamaModelName:
-        if settings.OLLAMA_BASE_URL:
-            chat_ollama = ChatOllama(
-                model=settings.OLLAMA_MODEL, temperature=0.5, base_url=settings.OLLAMA_BASE_URL
+        # Use provided OLLAMA_BASE_URL if available
+        base_url = settings.OLLAMA_BASE_URL
+        ollama_model = ChatOllama(
+            model=api_model_name,
+            temperature=0.5,
+            base_url=base_url if base_url else None,
+            # num_predict=4096,
+        )
+        
+        # 如果配置了 DMX 代理，则为 Ollama 添加回退机制
+        if settings.DMX_CHAT_URL or settings.COMPATIBLE_BASE_URL:
+            # 创建一个用于回退的 DMX 模型
+            fallback_model = ChatOpenAI(
+                model=settings.COMPATIBLE_MODEL or OpenAICompatibleName.GPT_4O_MINI.value,
+                temperature=0.5,
+                streaming=True,
+                base_url=settings.COMPATIBLE_BASE_URL or settings.DMX_CHAT_URL,
+                api_key=settings.COMPATIBLE_API_KEY or (settings.OPENAI_API_KEY.get_secret_value() if settings.OPENAI_API_KEY else None),
             )
-        else:
-            chat_ollama = ChatOllama(model=settings.OLLAMA_MODEL, temperature=0.5)
-        return chat_ollama
+            # 使用 LangChain 的 with_fallbacks 实现运行时自动切换
+            return ollama_model.with_fallbacks([fallback_model]) # type: ignore
+            
+        return ollama_model
     if model_name in OpenRouterModelName:
         return ChatOpenAI(
             model=api_model_name,
@@ -162,30 +184,32 @@ def get_embedding_model(embedding_provider: str = "ollama") -> Any:
             from langchain_ollama import OllamaEmbeddings
             # 尝试创建并返回Ollama embedding实例
             ollama_embeddings = OllamaEmbeddings(
-                model=settings.OLLAMA_EMBEDDING_MODEL,
+                model=_EMBEDDING_MODEL_TABLE["ollama"],
                 base_url=settings.OLLAMA_BASE_URL,
             )
             # 尝试进行一次简单的测试调用以确认连接可用
             ollama_embeddings.embed_query("test")
             return ollama_embeddings
-        except Exception:
+        except Exception as e:
             # 如果Ollama不可用，则忽略错误并继续尝试下一个选项
+            logger.error(f'ollama的embedding不可用, {e}')
             pass
     
-    # 2. 尝试OpenAI代理服务
-    if settings.DMX_CHAT_URL and settings.OPENAI_API_KEY:
+    # 2. 尝试OpenAI代理服务 (DMX)
+    if (settings.DMX_CHAT_URL or settings.COMPATIBLE_BASE_URL) and settings.OPENAI_API_KEY:
         try:
             from langchain_openai import OpenAIEmbeddings
             openai_embeddings = OpenAIEmbeddings(
                 model=_EMBEDDING_MODEL_TABLE["openai"],
-                openai_api_base=settings.DMX_CHAT_URL,
-                openai_api_key=settings.OPENAI_API_KEY.get_secret_value(),
+                base_url=settings.COMPATIBLE_BASE_URL or settings.DMX_CHAT_URL,
+                api_key=settings.OPENAI_API_KEY.get_secret_value()
             )
             # 尝试进行一次简单的测试调用以确认连接可用
             openai_embeddings.embed_query("test")
             return openai_embeddings
-        except Exception:
+        except Exception as e:
             # 如果OpenAI代理服务不可用，则忽略错误并继续尝试下一个选项
+            logger.error(f'openai代理服务的embedding不可用, {e}')
             pass
     
     # 3. 最后尝试标准OpenAI API
@@ -194,13 +218,14 @@ def get_embedding_model(embedding_provider: str = "ollama") -> Any:
             from langchain_openai import OpenAIEmbeddings
             openai_embeddings = OpenAIEmbeddings(
                 model=_EMBEDDING_MODEL_TABLE["openai"],
-                openai_api_key=settings.OPENAI_API_KEY.get_secret_value(),
+                api_key=settings.OPENAI_API_KEY.get_secret_value(),
             )
             # 尝试进行一次简单的测试调用以确认连接可用
             openai_embeddings.embed_query("test")
             return openai_embeddings
-        except Exception:
+        except Exception as e:
             # 所有服务都不可用
+            logger.error(f'openai服务的embedding不可用, {e}')
             pass
     
     raise ValueError("所有embedding服务都不可用：Ollama、DMX代理服务和OpenAI API")
