@@ -60,6 +60,7 @@ dependencies = [
     "langchain-mcp-adapters>=0.1.10",
     "ddgs>=9.9.1",
     "concurrent-log>=1.0.1",
+    "music21>=9.9.1"
 ]
 
 [dependency-groups]

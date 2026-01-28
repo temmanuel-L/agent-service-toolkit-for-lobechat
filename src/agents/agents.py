@@ -15,6 +15,7 @@ from agents.lazy_agent import LazyLoadingAgent
 from agents.rag_assistant import rag_assistant
 from agents.research_assistant import research_assistant
 from agents.simple_travel_planner_agent.simple_travel_planner_agent import simple_travel_planner_agent
+from agents.music_composer.music_composer import music_composer_agent
 from schema import AgentInfo
 
 DEFAULT_AGENT = "chatbot"
@@ -65,6 +66,10 @@ agents: dict[str, Agent] = {
     "simple-travel-planner": Agent(
         description="A simple travel planner assistant with structured data gathering.",
         graph_like=simple_travel_planner_agent,
+    ),
+    "music-composer": Agent(
+        description="An AI music composer that generates MIDI files based on style, mood, and key.",
+        graph_like=music_composer_agent,
     ),
 }
 
