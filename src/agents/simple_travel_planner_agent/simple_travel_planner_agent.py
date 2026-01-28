@@ -16,6 +16,7 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, MessagesState, StateGraph
+from langgraph.managed import RemainingSteps
 from langgraph.types import interrupt
 from pydantic import BaseModel, Field
 
@@ -33,6 +34,7 @@ class PlannerState(MessagesState, total=False):
     destination: Optional[str]
     interests: Optional[List[str]]
     itinerary: Optional[str]
+    remaining_steps: RemainingSteps
 
 
 # =============================================================================
@@ -79,9 +81,12 @@ def get_missing_fields(state: PlannerState) -> List[str]:
 
 
 # =============================================================================
-# Few-shot Examples for Tool Calling - Correct Pattern
+# Few-shot Examples for Tool Calling
 # =============================================================================
-def _build_tool_call_example(user_input: str, destination: Optional[str], interests: Optional[List[str]]) -> List:
+def _build_tool_call_example(
+        user_input: str,
+        destination: Optional[str],
+        interests: Optional[List[str]]) -> List:
     """Build a single few-shot example with proper tool_calls format."""
     tool_call_id = str(uuid.uuid4())
     return [
@@ -127,6 +132,7 @@ EXTRACTION_SYSTEM_PROMPT = """你是一个信息提取助手。你的任务是�
 # =============================================================================
 async def extract_info(state: PlannerState, config: RunnableConfig) -> dict:
     """Extract travel information from the latest user message using LLM with tool calling."""
+    logger.info(f"--- [EXTRACT INFO] Remaining steps: {state.get('remaining_steps')} ---")
     messages = state.get("messages", [])
     if not messages:
         logger.info("No messages to extract from, skipping extraction")
@@ -179,12 +185,28 @@ async def extract_info(state: PlannerState, config: RunnableConfig) -> dict:
             extracted = TravelInfoExtraction(**args)
             logger.info(f"Extracted: destination={extracted.destination}, interests={extracted.interests}")
             
-            # Build update dict with only non-None values
+            # Build update dict
             updates = {}
-            if extracted.destination and not state.get("destination"):
-                updates["destination"] = extracted.destination
-            if extracted.interests and not state.get("interests"):
-                updates["interests"] = extracted.interests
+            
+            # 1. State-aware Destination Logic: 
+            # If destination already exists, any new extracted destination is demoted to interests
+            if extracted.destination:
+                if not state.get("destination"):
+                    updates["destination"] = extracted.destination
+                else:
+                    logger.info(f"Destination already set ({state['destination']}), demoting '{extracted.destination}' to interests")
+                    if extracted.interests is None:
+                        extracted.interests = []
+                    if extracted.destination not in extracted.interests:
+                        extracted.interests.append(extracted.destination)
+            
+            # 2. Cumulative Interests Logic:
+            # Merge newly extracted interests with existing ones (avoid duplicates)
+            if extracted.interests:
+                existing_interests = state.get("interests") or []
+                # Use dict.fromkeys to maintain order and remove duplicates
+                merged_interests = list(dict.fromkeys(existing_interests + extracted.interests))
+                updates["interests"] = merged_interests
             
             return updates
         else:
@@ -201,6 +223,7 @@ async def extract_info(state: PlannerState, config: RunnableConfig) -> dict:
 # =============================================================================
 def ask_missing_info(state: PlannerState, config: RunnableConfig) -> dict:
     """Dynamically ask for missing required fields using interrupt."""
+    logger.info(f"--- [ASK MISSING] Remaining steps: {state.get('remaining_steps')} ---")
     missing_fields = get_missing_fields(state)
     
     if not missing_fields:
@@ -236,6 +259,7 @@ itinerary_prompt = ChatPromptTemplate.from_messages([
 
 async def create_itinerary(state: PlannerState, config: RunnableConfig) -> dict:
     """Generate the travel itinerary using the LLM."""
+    logger.info(f"--- [CREATE ITINERARY] Remaining steps: {state.get('remaining_steps')} ---")
     destination = state.get("destination", "未知目的地")
     interests = state.get("interests", [])
     interests_str = ", ".join(interests) if interests else "未指定"
@@ -321,4 +345,9 @@ workflow.add_edge("ask_missing", "extract_info")
 workflow.add_edge("create_itinerary", END)
 
 # Compile the graph
-simple_travel_planner_agent = workflow.compile()
+simple_travel_planner_agent = workflow.compile().with_config({'recursion_limit': 10})
+
+graph_obj = simple_travel_planner_agent.get_graph()
+pic = graph_obj.draw_mermaid_png()
+with open('state_graph_simple_travel_planner.png', 'wb') as f:
+    f.write(pic)

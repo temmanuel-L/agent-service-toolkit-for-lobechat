@@ -11,7 +11,7 @@ from fastapi import HTTPException, status
 from fastapi.responses import StreamingResponse
 from langchain_core.messages import AIMessage, AIMessageChunk, SystemMessage,HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
-from langfuse import Langfuse
+from langfuse import Langfuse, propagate_attributes
 from langfuse.langchain import CallbackHandler
 from langgraph.types import Command, Interrupt
 from langsmith import Client as LangsmithClient
@@ -145,8 +145,15 @@ async def invoke_handler(user_input: UserInput, agent_id: str = DEFAULT_AGENT) -
     # 注册 task event
     cancel_event = register_active_task(task_id)
 
+    # 从 config 中提取 user_id 和 thread_id 用于跟踪
+    configurable = kwargs["config"]["configurable"]
+    user_id = configurable.get("user_id")
+    thread_id = configurable.get("thread_id")
+
     try:
-        response_events: list[tuple[str, Any]] = await agent.ainvoke(**kwargs, stream_mode=["updates", "values"])  # type: ignore # fmt: skip
+        # 使用 propagate_attributes 追踪用户和会话 (Langfuse 最佳实践)
+        with propagate_attributes(user_id=user_id, session_id=thread_id):
+            response_events: list[tuple[str, Any]] = await agent.ainvoke(**kwargs, stream_mode=["updates", "values"])  # type: ignore # fmt: skip
         response_type, response = response_events[-1]
         if response_type == "values":
             # Normal response, the agent completed successfully
@@ -198,142 +205,148 @@ async def message_generator(
     #  注册 task event
     cancel_event = register_active_task(task_id)
 
+    # 从 config 中提取 user_id 和 thread_id 用于跟踪
+    configurable = kwargs["config"]["configurable"]
+    user_id = configurable.get("user_id")
+    thread_id = configurable.get("thread_id")
+
     # 共享账本：记录已发出的全部 AI 文本内容，用于多通道去重
     full_response = ""
 
     try:
-        # 从图中处理流式事件并通过SSE流消息发送给客户端
-        async for stream_event in agent.astream(
-            **kwargs, stream_mode=["updates", "messages", "custom"], subgraphs=True
-        ):
-            # 如果stop task接口已经被调用，说明要取消当前task
-            if cancel_event.is_set():
-                logger.info(f"任务 {task_id} 已收到停止指令，正在关闭流")
-                stop_message = _build_stop_chat_message(run_id, "当前对话已被用户手动停止")
-                yield f"data: {json.dumps({'type': 'message', 'content': stop_message.model_dump()})}\n\n"
-                break
+        # 从图中处理流式事件。使用 propagate_attributes 追踪用户和会话
+        with propagate_attributes(user_id=user_id, session_id=thread_id):
+            async for stream_event in agent.astream(
+                **kwargs, stream_mode=["updates", "messages", "custom"], subgraphs=True
+            ):
+                # 如果stop task接口已经被调用，说明要取消当前task
+                if cancel_event.is_set():
+                    logger.info(f"任务 {task_id} 已收到停止指令，正在关闭流")
+                    stop_message = _build_stop_chat_message(run_id, "当前对话已被用户手动停止")
+                    yield f"data: {json.dumps({'type': 'message', 'content': stop_message.model_dump()})}\n\n"
+                    break
 
-            if not isinstance(stream_event, tuple):
-                continue
-            # 根据是否使用子图处理不同的流事件结构
-            if len(stream_event) == 3:
-                # 使用subgraphs=True时: (node_path, stream_mode, event)
-                node_path, stream_mode, event = stream_event
-                # Removed verbose logging: logger.debug(f"LangGraph事件 [SUB]: node={node_path}, mode={stream_mode}")
-            else:
-                # 不使用subgraphs时: (stream_mode, event)
-                stream_mode, event = stream_event
-                # Removed verbose logging: logger.debug(f"LangGraph事件 [TOP]: mode={stream_mode}")
-            new_messages = []
-            # 处理updates类型的流事件，主要包含节点更新信息
-            if stream_mode == "updates":
-                for node, updates in event.items():
-                    # 处理agent中断的简单方法
-                    # 在更复杂的实现中，我们可以添加一些结构化的ChatMessage类型来返回中断值
-                    if node == "__interrupt__":
-                        for interrupt in updates:
-                            # 中断内容通常为非流式静态文本，需记录至账本同步
-                            val = interrupt.value if hasattr(interrupt, 'value') else str(interrupt)
-                            new_messages.append(AIMessage(content=val))
-                        continue
-                    updates = updates or {}
-                    update_messages = updates.get("messages", [])
-                    # 使用langgraph-supervisor库的特殊情况
-                    if "supervisor" in node or "sub-agent" in node:
-                        # if isinstance(update_messages[-1], ToolMessage):
-                        if isinstance(update_messages[-1] if update_messages else None, ToolMessage):
-                            if "sub-agent" in node and len(update_messages) > 1:
-                                # 如果这是子agent，我们希望保留最后2条消息 - handback工具及其结果
-                                update_messages = update_messages[-2:]
-                            else:
-                                # 如果这是supervisor，我们只想保留最后一条消息 - handoff结果工具来自'agent'节点
-                                update_messages = [update_messages[-1]]
-                        else:
-                            update_messages = []
-                    new_messages.extend(update_messages)
-
-            # 处理custom类型的流事件，直接事件作为消息
-            if stream_mode == "custom":
-                new_messages = [event]
-
-            # LangGraph流可能会发出元组: (field_name, field_value)
-            # 例如 ('content', <str>), ('tool_calls', [ToolCall,...]), ('additional_kwargs', {...}), 等等
-            # 我们只累积支持的字段到`parts`中并跳过不支持的元数据
-            # 更多信息请参见: https://langchain-ai.github.io/langgraph/cloud/how-tos/stream_messages/
-            processed_messages = []
-            current_message: dict[str, Any] = {}
-            for message in new_messages:
-                if isinstance(message, tuple):
-                    key, value = message
-                    current_message[key] = value
+                if not isinstance(stream_event, tuple):
+                    continue
+                # 根据是否使用子图处理不同的流事件结构
+                if len(stream_event) == 3:
+                    # 使用subgraphs=True时: (node_path, stream_mode, event)
+                    node_path, stream_mode, event = stream_event
+                    # Removed verbose logging: logger.debug(f"LangGraph事件 [SUB]: node={node_path}, mode={stream_mode}")
                 else:
-                    # 首先处理累积的部分消息
-                    if current_message:
-                        processed_messages.append(_create_ai_message(current_message))
-                        current_message = {}
-                    processed_messages.append(message)
+                    # 不使用subgraphs时: (stream_mode, event)
+                    stream_mode, event = stream_event
+                    # Removed verbose logging: logger.debug(f"LangGraph事件 [TOP]: mode={stream_mode}")
+                new_messages = []
+                # 处理updates类型的流事件，主要包含节点更新信息
+                if stream_mode == "updates":
+                    for node, updates in event.items():
+                        # 处理agent中断的简单方法
+                        # 在更复杂的实现中，我们可以添加一些结构化的ChatMessage类型来返回中断值
+                        if node == "__interrupt__":
+                            for interrupt in updates:
+                                # 中断内容通常为非流式静态文本，需记录至账本同步
+                                val = interrupt.value if hasattr(interrupt, 'value') else str(interrupt)
+                                new_messages.append(AIMessage(content=val))
+                            continue
+                        updates = updates or {}
+                        update_messages = updates.get("messages", [])
+                        # 使用langgraph-supervisor库的特殊情况
+                        if "supervisor" in node or "sub-agent" in node:
+                            # if isinstance(update_messages[-1], ToolMessage):
+                            if isinstance(update_messages[-1] if update_messages else None, ToolMessage):
+                                if "sub-agent" in node and len(update_messages) > 1:
+                                    # 如果这是子agent，我们希望保留最后2条消息 - handback工具及其结果
+                                    update_messages = update_messages[-2:]
+                                else:
+                                    # 如果这是supervisor，我们只想保留最后一条消息 - handoff结果工具来自'agent'节点
+                                    update_messages = [update_messages[-1]]
+                            else:
+                                update_messages = []
+                        new_messages.extend(update_messages)
 
-            # 添加任何剩余的消息部分
-            if current_message:
-                processed_messages.append(_create_ai_message(current_message))
+                # 处理custom类型的流事件，直接事件作为消息
+                if stream_mode == "custom":
+                    new_messages = [event]
 
-            # 处理消息并发送给客户端
-            for message in processed_messages:
-                try:
-                    chat_message = langchain_to_chat_message(message)
-                    chat_message.run_id = str(run_id)
-                except Exception as e:
-                    logger.error(f"解析消息时出错: {e}")
-                    yield f"data: {json.dumps({'type': 'error', 'content': '意外错误'})}\n\n"
-                    continue
-
-                logger.debug(f"准备发送消息: type={chat_message.type}, content_len={len(chat_message.content) if chat_message.content else 0}")
-                
-                if chat_message.type == "human" and (chat_message.content or "").strip() == (user_input.message or "").strip():
-                    continue
-                
-                # 保留逻辑：如果标记了跳过流式传输，则不发送
-                if chat_message.response_metadata.get("skip_stream"):
-                    continue
-                # --- 去重判定 (Last Lifeline Logic) ---
-                if chat_message.type == "ai" and not chat_message.tool_calls:
-                    content = chat_message.content or ""
-                    # 如果内容已部分或全部通过 messages 通道(token)发过了，则此块忽略
-                    if content.strip() and content.strip() in full_response:
-                        continue
-                    # 如果是新内容（如中断提示），正常发送并更新账本
-                    full_response += content
-
-                yield f"data: {json.dumps({'type': 'message', 'content': chat_message.model_dump()})}\n\n"
-
-            # 2. Token 流式分发 (Messages)
-            if stream_mode == "messages":
-                if not user_input.stream_tokens:
-                    continue
-                msg, metadata = event
-                
-                # 核心修复：检查 metadata 和消息本身的 skip 标记
-                if "skip_stream" in metadata.get("tags", []):
-                    continue
-                if hasattr(msg, "response_metadata") and msg.response_metadata.get("skip_stream"):
-                    continue
-                    
-                if not isinstance(msg, (AIMessageChunk, AIMessage)):
-                    continue
-                
-                content = remove_tool_calls(msg.content)
-                if content:
-                    chunk_str = convert_message_content_to_string(content)
-                    
-                    # 增量提取：处理累积流 (A -> AB -> ABC)
-                    if full_response and chunk_str.startswith(full_response):
-                        delta = chunk_str[len(full_response):]
+                # LangGraph流可能会发出元组: (field_name, field_value)
+                # 例如 ('content', <str>), ('tool_calls', [ToolCall,...]), ('additional_kwargs', {...}), 等等
+                # 我们只累积支持的字段到`parts`中并跳过不支持的元数据
+                # 更多信息请参见: https://langchain-ai.github.io/langgraph/cloud/how-tos/stream_messages/
+                processed_messages = []
+                current_message: dict[str, Any] = {}
+                for message in new_messages:
+                    if isinstance(message, tuple):
+                        key, value = message
+                        current_message[key] = value
                     else:
-                        delta = chunk_str
+                        # 首先处理累积的部分消息
+                        if current_message:
+                            processed_messages.append(_create_ai_message(current_message))
+                            current_message = {}
+                        processed_messages.append(message)
+
+                # 添加任何剩余的消息部分
+                if current_message:
+                    processed_messages.append(_create_ai_message(current_message))
+
+                # 处理消息并发送给客户端
+                for message in processed_messages:
+                    try:
+                        chat_message = langchain_to_chat_message(message)
+                        chat_message.run_id = str(run_id)
+                    except Exception as e:
+                        logger.error(f"解析消息时出错: {e}")
+                        yield f"data: {json.dumps({'type': 'error', 'content': '意外错误'})}\n\n"
+                        continue
+
+                    logger.debug(f"准备发送消息: type={chat_message.type}, content_len={len(chat_message.content) if chat_message.content else 0}")
                     
-                    if delta:
-                        full_response += delta
-                        yield f"data: {json.dumps({'type': 'token', 'content': delta}, ensure_ascii=False)}\n\n"
+                    if chat_message.type == "human" and (chat_message.content or "").strip() == (user_input.message or "").strip():
+                        continue
+                    
+                    # 保留逻辑：如果标记了跳过流式传输，则不发送
+                    if chat_message.response_metadata.get("skip_stream"):
+                        continue
+                    # --- 去重判定 (Last Lifeline Logic) ---
+                    if chat_message.type == "ai" and not chat_message.tool_calls:
+                        content = chat_message.content or ""
+                        # 如果内容已部分或全部通过 messages 通道(token)发过了，则此块忽略
+                        if content.strip() and content.strip() in full_response:
+                            continue
+                        # 如果是新内容（如中断提示），正常发送并更新账本
+                        full_response += content
+
+                    yield f"data: {json.dumps({'type': 'message', 'content': chat_message.model_dump()})}\n\n"
+
+                # 2. Token 流式分发 (Messages)
+                if stream_mode == "messages":
+                    if not user_input.stream_tokens:
+                        continue
+                    msg, metadata = event
+                    
+                    # 核心修复：检查 metadata 和消息本身的 skip 标记
+                    if "skip_stream" in metadata.get("tags", []):
+                        continue
+                    if hasattr(msg, "response_metadata") and msg.response_metadata.get("skip_stream"):
+                        continue
+                        
+                    if not isinstance(msg, (AIMessageChunk, AIMessage)):
+                        continue
+                    
+                    content = remove_tool_calls(msg.content)
+                    if content:
+                        chunk_str = convert_message_content_to_string(content)
+                        
+                        # 增量提取：处理累积流 (A -> AB -> ABC)
+                        if full_response and chunk_str.startswith(full_response):
+                            delta = chunk_str[len(full_response):]
+                        else:
+                            delta = chunk_str
+                        
+                        if delta:
+                            full_response += delta
+                            yield f"data: {json.dumps({'type': 'token', 'content': delta}, ensure_ascii=False)}\n\n"
     except Exception as e:
         logger.error(f"生成器崩溃: {e}", exc_info=True)
         yield f"data: {json.dumps({'type': 'error', 'content': 'Internal server error'})}\n\n"
