@@ -24,6 +24,8 @@ AI 音乐作曲智能体 - 基于 LangGraph 实现
 """
 
 import os
+import re
+import asyncio
 import random
 import tempfile
 import uuid
@@ -69,6 +71,8 @@ class MusicState(MessagesState, total=False):
     mood: Optional[str]
     # 调式 (如: C大调、A小调)
     key: Optional[str]
+    # 音乐时长 (秒)
+    duration: Optional[int]
     # 生成的旋律描述
     melody: Optional[str]
     # 生成的和声描述
@@ -106,6 +110,10 @@ class MusicInfoExtraction(BaseModel):
         default=None,
         description="音乐调式，如：C大调(C major)、A小调(A minor)、G大调(G major)等。"
                     "如果用户没有明确指定，可以留空。"
+    )
+    duration: Optional[int] = Field(
+        default=30,
+        description="音乐时长（秒）。如果用户指定了分钟，请转换为秒。默认30秒。"
     )
 
 
@@ -147,7 +155,8 @@ def _build_tool_call_example(
         user_input: str,
         style: Optional[str],
         mood: Optional[str],
-        key: Optional[str] = None) -> List:
+        key: Optional[str] = None,
+        duration: Optional[int] = None) -> List:
     """
     构建单个 few-shot 示例，使用正确的 tool_calls 格式。
     
@@ -166,7 +175,7 @@ def _build_tool_call_example(
         AIMessage(content="", tool_calls=[{
             "id": tool_call_id,
             "name": "MusicInfoExtraction",
-            "args": {"style": style, "mood": mood, "key": key}
+            "args": {"style": style, "mood": mood, "key": key, "duration": duration}
         }]),
         ToolMessage(content="已成功提取音乐信息", tool_call_id=tool_call_id),
     ]
@@ -182,23 +191,23 @@ def _get_extraction_examples() -> List:
     examples = []
     # 示例 1: 完整信息
     examples.extend(_build_tool_call_example(
-        "帮我创作一首欢快的爵士乐，用G大调",
-        "爵士", "欢快", "G大调"
+        "帮我创作一首欢快的爵士乐，用G大调，大概1分钟",
+        "爵士", "欢快", "G大调", 60
     ))
     # 示例 2: 只有风格和情绪
     examples.extend(_build_tool_call_example(
         "我想要一首悲伤的古典钢琴曲",
-        "古典", "悲伤", None
+        "古典", "悲伤", None, 30
     ))
     # 示例 3: 只有情绪
     examples.extend(_build_tool_call_example(
         "来点激昂的音乐",
-        None, "激昂", None
+        None, "激昂", None, 30
     ))
     # 示例 4: 没有可提取的信息
     examples.extend(_build_tool_call_example(
         "你好",
-        None, None, None
+        None, None, None, None
     ))
     return examples
 
@@ -213,8 +222,10 @@ EXTRACTION_SYSTEM_PROMPT = """你是一个音乐信息提取助手。你的任�
 1. style: 提取音乐风格，如古典、爵士、流行、电子、摇滚、乡村等。
 2. mood: 提取音乐情绪/氛围，如欢快、悲伤、激昂、平静、神秘等。
 3. key: 提取调式，如C大调、A小调等。如果用户没有明确指定，则为 null。
-4. 只提取用户明确提到的信息，不要猜测。
-5. 必须调用 MusicInfoExtraction 工具返回结果。"""
+3. key: 提取调式，如C大调、A小调等。如果用户没有明确指定，则为 null。
+4. duration: 提取音乐时长（秒）。"2分钟"->120。默认30。
+5. 只提取用户明确提到的信息，不要猜测。
+6. 必须调用 MusicInfoExtraction 工具返回结果。"""
 
 
 # =============================================================================
@@ -287,6 +298,8 @@ async def extract_info(state: MusicState, config: RunnableConfig) -> dict:
                 updates["mood"] = extracted.mood
             if extracted.key and not state.get("key"):
                 updates["key"] = extracted.key
+            if extracted.duration and not state.get("duration"):
+                updates["duration"] = extracted.duration
             
             return updates
         else:
@@ -341,10 +354,14 @@ melody_prompt = ChatPromptTemplate.from_messages([
      "你是一位专业的作曲家。请根据以下要求生成旋律。\n"
      "风格: {style}\n"
      "情绪: {mood}\n"
-     "调式: {key}\n\n"
-     "请用 music21 格式描述旋律，包含音符名称和八度（如 C4, D4, E4）。\n"
-     "只输出音符序列，用逗号分隔，不要任何其他解释。"),
-    ("human", "请为我生成旋律。"),
+     "调式: {key}\n"
+     "用户原始要求: {user_input}\n\n"
+     "规则：\n"
+     "1. 用 music21 格式描述旋律 (如 C4, D4, E4)。\n"
+     "2. 严禁输出任何对话文本！严禁输出 '当然可以' 等废话。\n"
+     "3. 只输出音符序列 CSV，用逗号分隔，不要换行。\n"
+     "4. 生成长度限制：4小节 (约16-32个音符)，保持精简。"),
+    ("human", "开始生成。"),
 ])
 
 
@@ -364,20 +381,29 @@ async def generate_melody(state: MusicState, config: RunnableConfig) -> dict:
     style = state.get("style", "古典")
     mood = state.get("mood", "平静")
     key = state.get("key", "C大调")
+    user_input = state.get("musician_input", "")
     
     llm = get_model(config["configurable"].get("model", settings.DEFAULT_MODEL))
     
     formatted_messages = melody_prompt.format_messages(
         style=style,
         mood=mood,
-        key=key
+        key=key,
+        user_input=user_input
     )
     
     try:
-        response = await llm.with_config(tags=["skip_stream"]).ainvoke(formatted_messages, config)
+        # 增加超时控制 (30秒)
+        response = await asyncio.wait_for(
+            llm.with_config(tags=["skip_stream"]).ainvoke(formatted_messages, config),
+            timeout=30.0
+        )
         melody_content = response.content
         logger.info(f"生成的旋律: {melody_content[:100]}...")
         return {"melody": melody_content}
+    except asyncio.TimeoutError:
+        logger.error("旋律生成超时")
+        return {"melody": "C4, D4, E4, F4, G4, A4, B4, C5"}
     except Exception as e:
         logger.error(f"旋律生成失败: {e}")
         return {"melody": "C4, D4, E4, F4, G4, A4, B4, C5"}  # 默认旋律
@@ -391,9 +417,11 @@ harmony_prompt = ChatPromptTemplate.from_messages([
      "你是一位专业的作曲家。请为以下旋律创建和声。\n"
      "旋律: {melody}\n"
      "风格: {style}\n\n"
-     "请用 music21 格式描述和弦，如 C4-E4-G4 表示 C 大三和弦。\n"
-     "只输出和弦序列，用逗号分隔，不要任何其他解释。"),
-    ("human", "请为我生成和声。"),
+     "规则：\n"
+     "1. 用 music21 格式描述和弦 (如 C4-E4-G4)。\n"
+     "2. 严禁输出任何对话文本！只输出 CSV。\n"
+     "3. 和弦数量应与旋律小节数匹配 (约4-8个和弦即可)。"),
+    ("human", "开始生成。"),
 ])
 
 
@@ -421,10 +449,16 @@ async def generate_harmony(state: MusicState, config: RunnableConfig) -> dict:
     )
     
     try:
-        response = await llm.with_config(tags=["skip_stream"]).ainvoke(formatted_messages, config)
+        response = await asyncio.wait_for(
+            llm.with_config(tags=["skip_stream"]).ainvoke(formatted_messages, config),
+            timeout=30.0
+        )
         harmony_content = response.content
         logger.info(f"生成的和声: {harmony_content[:100]}...")
         return {"harmony": harmony_content}
+    except asyncio.TimeoutError:
+         logger.error("和声生成超时")
+         return {"harmony": "C4-E4-G4, F4-A4-C5, G4-B4-D5, C4-E4-G4"}
     except Exception as e:
         logger.error(f"和声生成失败: {e}")
         return {"harmony": "C4-E4-G4, F4-A4-C5, G4-B4-D5, C4-E4-G4"}  # 默认和声
@@ -439,9 +473,11 @@ rhythm_prompt = ChatPromptTemplate.from_messages([
      "旋律: {melody}\n"
      "和声: {harmony}\n"
      "情绪: {mood}\n\n"
-     "请用时值描述节奏，如 quarter, half, whole, eighth 等。\n"
-     "只输出节奏序列，用逗号分隔，不要任何其他解释。"),
-    ("human", "请为我生成节奏。"),
+     "规则：\n"
+     "1. 用时值描述节奏 (如 quarter, half)。\n"
+     "2. 严禁输出任何对话文本！只输出 CSV。\n"
+     "3. 保持节奏简单明了。"),
+    ("human", "开始生成。"),
 ])
 
 
@@ -471,7 +507,10 @@ async def generate_rhythm(state: MusicState, config: RunnableConfig) -> dict:
     )
     
     try:
-        response = await llm.with_config(tags=["skip_stream"]).ainvoke(formatted_messages, config)
+        response = await asyncio.wait_for(
+            llm.with_config(tags=["skip_stream"]).ainvoke(formatted_messages, config),
+            timeout=30.0
+        )
         rhythm_content = response.content
         logger.info(f"生成的节奏: {rhythm_content[:100]}...")
         
@@ -481,6 +520,12 @@ async def generate_rhythm(state: MusicState, config: RunnableConfig) -> dict:
         return {
             "rhythm": rhythm_content,
             "composition": composition
+        }
+    except asyncio.TimeoutError:
+        logger.error("节奏生成超时")
+        return {
+            "rhythm": "quarter, quarter, quarter, quarter",
+            "composition": f"旋律: {melody}\n和声: {harmony}\n节奏: quarter, quarter, quarter, quarter"
         }
     except Exception as e:
         logger.error(f"节奏生成失败: {e}")
@@ -552,45 +597,30 @@ async def convert_to_midi(state: MusicState, config: RunnableConfig) -> dict:
     """
     将作曲转换为 MIDI 文件并返回下载链接。
     
-    由于 OpenAI 兼容接口无法直接传输二进制音频，
-    本函数将 MIDI 文件保存到静态资源目录并返回 URL。
-    
-    Args:
-        state: 当前状态
-        config: 运行配置
-    
-    Returns:
-        包含 AI 消息（带音乐链接）的状态更新字典
+    功能升级：
+    1. 使用正则解析 LLM 输出，过滤“话痨”文本。
+    2. 根据用户要求的 duration 循环填充旋律。
+    3. 增加容错逻辑。
     """
     logger.info(f"--- [CONVERT TO MIDI] ---")
     
     style = state.get("style", "古典")
     mood = state.get("mood", "平静")
     key = state.get("key", "C大调")
+    duration = state.get("duration", 30) or 30
+    
     parsed_key = _parse_key(key)
     
-    # 检查 music21 是否可用
+    # 获取生成的内容
+    melody_str = state.get("melody", "")
+    harmony_str = state.get("harmony", "")
+    rhythm_str = state.get("rhythm", "")
+    
     if not MUSIC21_AVAILABLE:
-        logger.warning("music21 库未安装，无法生成 MIDI 文件")
+        logger.warning("music21 库未安装")
         return {
-            "messages": [AIMessage(content=(
-                f"🎵 **音乐作品已完成！**\n\n"
-                f"**风格**: {style}\n"
-                f"**情绪**: {mood}\n"
-                f"**调式**: {parsed_key}\n\n"
-                f"---\n"
-                f"抱歉，由于服务器未安装 music21 库，无法生成 MIDI 文件。\n"
-                f"请联系管理员安装依赖：`pip install music21`"
-            ))],
-            "midi_file": None,
-            # 重置状态以便下次创作
-            "style": None,
-            "mood": None,
-            "key": None,
-            "melody": None,
-            "harmony": None,
-            "rhythm": None,
-            "composition": None,
+            "messages": [AIMessage(content="无法生成 MIDI (Missing music21)")],
+            "midi_file": None
         }
     
     try:
@@ -599,102 +629,108 @@ async def convert_to_midi(state: MusicState, config: RunnableConfig) -> dict:
         
         # 创建 music21 乐谱
         piece = music21.stream.Score()
+        tempo_val = 120 if mood in ['欢快', '激昂'] else 60
+        piece.insert(0, music21.tempo.MetronomeMark(number=tempo_val))
         
-        # 获取对应调式的音阶和和弦
-        scale = SCALES.get(parsed_key, SCALES['C大调'])
-        chord_notes = CHORDS.get(parsed_key, CHORDS['C大调'])
+        # --- 解析旋律 ---
+        # 提取形如 C4, D#5, E-3 的音符
+        melody_notes_str = re.findall(r"([A-G][b#-]?[0-9])", melody_str)
+        if not melody_notes_str:
+            logger.warning("未解析到有效旋律，使用随机兜底")
+            scale = SCALES.get(parsed_key, SCALES['C大调'])
+            melody_notes_str = [random.choice(scale) + '4' for _ in range(8)]
+            
+        # --- 解析和声 ---
+        # 提取形如 C4-E4-G4 的和弦
+        harmony_chords_str = re.findall(r"([A-G][b#-]?[0-9](?:-[A-G][b#-]?[0-9])+)", harmony_str)
+        if not harmony_chords_str:
+            chord_notes = CHORDS.get(parsed_key, CHORDS['C大调'])
+            harmony_chords_str = ['-'.join(chord_notes)] * 4
+
+        # --- 计算循环次数 ---
+        # 假设每个音符约 0.5 秒 (120BPM quarter=0.5s, 60BPM quarter=1s)
+        # 简单估算：120 BPM 下，一拍 0.5s。
+        seconds_per_beat = 60 / tempo_val
+        total_beats_needed = duration / seconds_per_beat
         
-        # 根据情绪调整音乐特征
-        if mood in ['欢快', 'happy', '激昂', 'exciting']:
-            tempo = 120
-            note_count = 16
-        elif mood in ['悲伤', 'sad', '平静', 'calm']:
-            tempo = 60
-            note_count = 12
-        else:
-            tempo = 90
-            note_count = 14
+        # 假设 LLM 生成的 motif 长度为 N 个音符，每个音符默认 1 拍
+        motif_len = len(melody_notes_str)
+        loops = int(total_beats_needed / max(motif_len, 1)) + 1
         
-        # 创建旋律声部
+        logger.info(f"目标时长: {duration}s, 速度: {tempo_val} BPM, 需要拍数: {total_beats_needed}, 循环次数: {loops}")
+
+        # --- 构建旋律声部 ---
         melody_part = music21.stream.Part()
         melody_part.id = 'melody'
-        for i in range(note_count):
-            note = music21.note.Note(random.choice(scale) + str(random.choice([4, 5])))
-            note.quarterLength = random.choice([0.5, 1, 1.5, 2])
-            melody_part.append(note)
         
-        # 创建和声声部
+        current_beat = 0
+        for _ in range(loops):
+            for note_name in melody_notes_str:
+                if current_beat >= total_beats_needed:
+                    break
+                try:
+                    n = music21.note.Note(note_name)
+                    n.quarterLength = 1.0 # 默认一拍
+                    melody_part.append(n)
+                    current_beat += 1
+                except:
+                    pass
+        
+        # --- 构建和声声部 ---
         harmony_part = music21.stream.Part()
         harmony_part.id = 'harmony'
-        for i in range(note_count // 2):
-            chord = music21.chord.Chord(chord_notes)
-            chord.quarterLength = 2
-            harmony_part.append(chord)
         
-        # 设置速度
-        piece.insert(0, music21.tempo.MetronomeMark(number=tempo))
-        
-        # 添加声部到乐谱
+        current_beat = 0
+        harmony_len = len(harmony_chords_str)
+        for i in range(loops * 4): # 和声通常比旋律慢，稍微多循环一点以防万一
+             if current_beat >= total_beats_needed:
+                    break
+             chord_str = harmony_chords_str[i % harmony_len]
+             try:
+                 notes = chord_str.split('-')
+                 c = music21.chord.Chord(notes)
+                 c.quarterLength = 2.0 # 和弦占2拍
+                 harmony_part.append(c)
+                 current_beat += 2
+             except:
+                 pass
+
         piece.append(melody_part)
         piece.append(harmony_part)
         
-        # 生成唯一文件名
+        # 保存文件
         file_id = str(uuid.uuid4())[:8]
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"composition_{timestamp}_{file_id}.mid"
         filepath = MIDI_OUTPUT_DIR / filename
-        
-        # 写入 MIDI 文件
         piece.write('midi', fp=str(filepath))
-        logger.info(f"MIDI 文件已保存: {filepath}")
         
-        # 构建下载 URL
-        # 注意：在 Docker 网络中 settings.BASE_URL 可能是 http://0.0.0.0:8080，
-        # 但用户浏览器需要访问 localhost (或实际服务器 IP)。
         base_url = settings.BASE_URL.replace("0.0.0.0", "localhost")
         download_url = f"{base_url}{settings.STATIC_URL}/music/{filename}"
         
-        # 返回带有下载链接的消息
         return {
             "messages": [AIMessage(content=(
                 f"🎵 **您的音乐作品已完成！**\n\n"
                 f"**风格**: {style}\n"
                 f"**情绪**: {mood}\n"
                 f"**调式**: {parsed_key}\n"
-                f"**速度**: {tempo} BPM\n\n"
+                f"**时长**: 约 {duration} 秒\n\n"
                 f"---\n"
-                f"📥 **[点击此处下载 MIDI 文件]({download_url})**\n\n"
-                f"您可以使用任意 MIDI 播放器（如 [Online Sequencer](https://onlinesequencer.net/)）"
-                f"来聆听您的作品！"
+                f"📥 **[点击此处下载 MIDI 文件]({download_url})**"
             ))],
             "midi_file": str(filepath),
-            # 重置状态以便下次创作
-            "style": None,
-            "mood": None,
-            "key": None,
-            "melody": None,
-            "harmony": None,
-            "rhythm": None,
-            "composition": None,
+            # 清理状态
+            "style": None, "mood": None, "key": None, "duration": None,
+            "melody": None, "harmony": None, "rhythm": None, "composition": None, 
+            "musician_input": None
         }
-        
+
     except Exception as e:
-        logger.error(f"MIDI 转换失败: {e}")
+        logger.error(f"MIDI 转换失败: {e}", exc_info=True)
         return {
-            "messages": [AIMessage(content=(
-                f"🎵 **音乐作品构思完成！**\n\n"
-                f"**风格**: {style}\n"
-                f"**情绪**: {mood}\n"
-                f"**调式**: {parsed_key}\n\n"
-                f"---\n"
-                f"抱歉，生成 MIDI 文件时遇到问题：{str(e)}\n"
-                f"请稍后重试。"
-            ))],
-            "midi_file": None,
-            # 重置状态
-            "style": None,
-            "mood": None,
-            "key": None,
+             "messages": [AIMessage(content=f"生成出错: {str(e)}")],
+             "midi_file": None,
+             "style": None, "mood": None, "key": None, "duration": None
         }
 
 

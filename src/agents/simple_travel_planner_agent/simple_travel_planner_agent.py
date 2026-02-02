@@ -347,7 +347,10 @@ workflow.add_edge("create_itinerary", END)
 # Compile the graph
 simple_travel_planner_agent = workflow.compile().with_config({'recursion_limit': 10})
 
-graph_obj = simple_travel_planner_agent.get_graph()
-pic = graph_obj.draw_mermaid_png()
-with open('state_graph_simple_travel_planner.png', 'wb') as f:
-    f.write(pic)
+try:
+    graph_obj = simple_travel_planner_agent.get_graph()
+    pic = graph_obj.draw_mermaid_png()
+    with open('state_graph_simple_travel_planner.png', 'wb') as f:
+        f.write(pic)
+except Exception as e:
+    logger.warning(f"Failed to generate graph image: {e}")
