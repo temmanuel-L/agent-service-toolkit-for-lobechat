@@ -494,7 +494,7 @@ async def generate_rhythm(state: MusicState, config: RunnableConfig) -> dict:
 # 节点: 转换为 MIDI (Convert to MIDI Node)
 # =============================================================================
 # MIDI 文件存储目录（静态资源目录）
-MIDI_OUTPUT_DIR = Path(__file__).parent.parent.parent / "static" / "music"
+MIDI_OUTPUT_DIR = settings.STATIC_DIR / "music"
 
 # 音阶定义
 SCALES = {
@@ -648,8 +648,11 @@ async def convert_to_midi(state: MusicState, config: RunnableConfig) -> dict:
         piece.write('midi', fp=str(filepath))
         logger.info(f"MIDI 文件已保存: {filepath}")
         
-        # 构建下载 URL（假设静态资源通过 /static/music/ 路径提供）
-        download_url = f"/static/music/{filename}"
+        # 构建下载 URL
+        # 注意：在 Docker 网络中 settings.BASE_URL 可能是 http://0.0.0.0:8080，
+        # 但用户浏览器需要访问 localhost (或实际服务器 IP)。
+        base_url = settings.BASE_URL.replace("0.0.0.0", "localhost")
+        download_url = f"{base_url}{settings.STATIC_URL}/music/{filename}"
         
         # 返回带有下载链接的消息
         return {

@@ -10,6 +10,7 @@ from pydantic import (
     TypeAdapter,
     computed_field,
 )
+from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from schema.models import (
@@ -273,10 +274,24 @@ class Settings(BaseSettings):
                 case _:
                     raise ValueError(f"Unknown provider: {provider}")
 
-    @computed_field  # type: ignore[prop-decorator]
+    @computed_field
     @property
     def BASE_URL(self) -> str:
         return f"http://{self.HOST}:{self.PORT}"
+    
+    @computed_field
+    @property
+    def STATIC_URL(self) -> str:
+        return "/static"
+
+    @computed_field
+    @property
+    def STATIC_DIR(self) -> Path:
+        from pathlib import Path
+        # Returs absolute path using current working directory
+        # Docker: /app/static (WORKDIR is /app)
+        # Local: <project_root>/static (assuming run from root)
+        return Path("static").absolute()
 
     def is_dev(self) -> bool:
         return self.MODE == "dev"

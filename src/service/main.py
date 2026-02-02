@@ -32,6 +32,8 @@ logger = get_logger(__name__)
 
 router = APIRouter(dependencies=[Depends(verify_bearer)])
 
+from fastapi.staticfiles import StaticFiles
+
 app = FastAPI(
     lifespan=lifespan,
     generate_unique_id_function=lambda route: route.name,
@@ -39,6 +41,16 @@ app = FastAPI(
     # redoc_url=None,
     # openapi_url=None,
 )
+
+from core import settings
+
+# 挂载静态文件目录
+try:
+    if not settings.STATIC_DIR.exists():
+        settings.STATIC_DIR.mkdir(parents=True, exist_ok=True)
+    app.mount(settings.STATIC_URL, StaticFiles(directory=str(settings.STATIC_DIR)), name="static")
+except Exception as e:
+    logger.warning(f"Failed to mount static directory: {e}")
 
 
 @router.get("/info")

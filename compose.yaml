@@ -66,6 +66,7 @@ services:
     volumes:
       - log:/log/
       - ./src:/app/src
+      - ./static:/app/static
     develop:
       watch:
         - path: src/agents/
