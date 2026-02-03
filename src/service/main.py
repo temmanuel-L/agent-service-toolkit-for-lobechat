@@ -26,6 +26,7 @@ from .responses import _sse_response_example
 from .task_manager import stop_task as task_manager_stop_task
 from .openai_paradigm import chat_completions_handler
 from utils.log_utils import get_logger
+from rag.service import rag_service
 
 logger = get_logger(__name__)
 
@@ -211,6 +212,67 @@ async def stop_task(input_data: StopTaskInput):
     return await task_manager_stop_task(input_data)
 
 
+@router.post("/api/kb/ingest")
+async def kb_ingest(request: Request):
+    """
+    知识库文件入库接口
+    接收来自 LobeChat 的文件 URL 和知识库 ID，执行异步向量化入库
+    """
+    try:
+        body = await request.json()
+        file_url = body.get("file_url")
+        kb_id = body.get("kb_id")
+        file_name = body.get("file_name")
+
+        if not file_url or not kb_id:
+            return {"status": "error", "message": "Missing file_url or kb_id"}
+
+        logger.info(f"Received KB ingest request: kb_id={kb_id}, file={file_name}")
+        
+        # 执行入库 (由于 LobeChat 前端可能是 fire-and-forget，我们同步等待还是异步取决于需求)
+        # 这里先由于涉及文件下载和处理，我们直接 await 并在完成后返回
+        chunks_count = await rag_service.ingest_file(
+            file_url=file_url,
+            kb_id=kb_id,
+            file_name=file_name
+        )
+        
+        return {
+            "status": "success",
+            "kb_id": kb_id,
+            "chunks_count": chunks_count
+        }
+    except Exception as e:
+        logger.error(f"KB Ingest API Error: {str(e)}")
+        return {"status": "error", "message": str(e)}
+
+
+@router.post("/api/kb/delete")
+async def kb_delete(request: Request):
+    """
+    知识库删除接口
+    删除 Qdrant 中对应的 Collection
+    """
+    try:
+        body = await request.json()
+        kb_id = body.get("kb_id")
+
+        if not kb_id:
+            return {"status": "error", "message": "Missing kb_id"}
+
+        logger.info(f"Received KB delete request: kb_id={kb_id}")
+        
+        success = await rag_service.delete_knowledge_base(kb_id)
+        
+        if success:
+            return {"status": "success", "kb_id": kb_id}
+        else:
+            return {"status": "error", "message": f"Failed to delete KB or KB not found: {kb_id}"}
+    except Exception as e:
+        logger.error(f"KB Delete API Error: {str(e)}")
+        return {"status": "error", "message": str(e)}
+
+
 @app.post("/v1/chat/completions")
 async def openai_chat_completions(
         request: OpenAIChatCompletionRequest,
@@ -245,7 +307,8 @@ async def openai_chat_completions(
         "frequency_penalty": getattr(request, 'frequency_penalty', None),
         "messages_count": len(request.messages) if request.messages else 0,
         "user": request.user,
-        "topicId": getattr(request, 'topicId', None),  # 新增：记录 topicId
+        "topicId": getattr(request, 'topicId', None),
+        "kb_ids": getattr(request, 'kb_ids', None),  # 新增：记录 kb_ids
         "messages": [
             {"role": msg.get("role"), "content": str(msg.get("content", ""))[:200]}
             for msg in (request.messages or [])[-5:]  # 只打印前5条消息的前200字符

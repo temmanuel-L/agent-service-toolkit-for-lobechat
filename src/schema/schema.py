@@ -312,6 +312,7 @@ class OpenAIChatCompletionRequest(BaseModel):
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
     user: str | None = None
+    kb_ids: list[str] | None = None
 
 
 class OpenAIChatMessage(BaseModel):

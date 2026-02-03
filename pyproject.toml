@@ -60,7 +60,13 @@ dependencies = [
     "langchain-mcp-adapters>=0.1.10",
     "ddgs>=9.9.1",
     "concurrent-log>=1.0.1",
-    "music21>=9.9.1"
+    "music21>=9.9.1",
+    "llama-index-core ~= 0.12.0",
+    "llama-index-vector-stores-qdrant ~= 0.4.0",
+    "llama-index-readers-file ~= 0.4.0",
+    "llama-index-llms-openai ~= 0.3.0",
+    "llama-index-embeddings-langchain ~= 0.3.0",
+    "python-multipart ~= 0.0.12"
 ]
 
 [dependency-groups]

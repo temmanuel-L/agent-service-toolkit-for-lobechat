@@ -48,7 +48,8 @@ async def chat_completions_handler(
             "max_tokens": request.max_tokens,
             "presence_penalty": request.presence_penalty,
             "frequency_penalty": request.frequency_penalty,
-            "stop": request.stop
+            "stop": request.stop,
+            "kb_ids": request.kb_ids
         }
     )
 
