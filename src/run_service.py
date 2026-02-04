@@ -5,18 +5,14 @@ import sys
 import uvicorn
 from dotenv import load_dotenv
 
-from core import settings
-
 load_dotenv()
 
-if __name__ == "__main__":
-    root_logger = logging.getLogger()
-    if root_logger.handlers:
-        print(
-            f"Warning: Root logger already has {len(root_logger.handlers)} handler(s) configured. "
-            f"basicConfig() will be ignored. Current level: {logging.getLevelName(root_logger.level)}"
-        )
+# Import core early - this triggers logging configuration in core/__init__.py
+from core import settings
 
+
+if __name__ == "__main__":
+    # Basic logging setup (noisy loggers already suppressed in core/__init__.py)
     logging.basicConfig(level=settings.LOG_LEVEL.to_logging_level())
     # Set Compatible event loop policy on Windows Systems.
     # On Windows systems, the default ProactorEventLoop can cause issues with

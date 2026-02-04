@@ -20,6 +20,8 @@ import logging
 logger = get_logger(__name__)
 
 
+
+
 async def _setup_memory_components(saver: Any, store: Any) -> None:
     """
     初始化短期与长期记忆组件
@@ -115,12 +117,38 @@ async def _ensure_qdrant_collection(
                 raise
 
 
+async def _sync_all_qdrant_collections(
+    qdrant_client: Any,
+    vector_size: int,
+) -> None:
+    """
+    同步 Qdrant 中所有集合的维度。
+
+    该函数获取 Qdrant 中现有的所有集合，并逐一检查维度。
+    如果不匹配则自动重建，确保系统可用性。
+
+    Args:
+        qdrant_client (Any): Qdrant 客户端
+        vector_size (int): 当前 embedding 模型的维度
+    """
+    existing_collections = await _get_existing_collections(qdrant_client)
+    
+    # 确保 'agent_conversations' 始终存在（即使 Qdrant 是空的）
+    if "agent_conversations" not in existing_collections:
+        logger.info("初始化 'agent_conversations' 集合...")
+        await _ensure_qdrant_collection("agent_conversations", qdrant_client, existing_collections, vector_size)
+    
+    # 对所有已存在的集合（包括 'agent_conversations' 和各类 KB 集合）进行检查/同步
+    # 注意：使用 list(existing_collections) 是因为 _ensure_qdrant_collection 可能会修改 existing_collections
+    for collection_name in list(existing_collections):
+        await _ensure_qdrant_collection(collection_name, qdrant_client, existing_collections, vector_size)
+
+
 async def _initialize_agent_resources(
     agent_key: str,
     saver: Any,
     store: Any,
     qdrant_client: Any,
-    existing_collections: set[str],
     vector_size: int,  # 新增参数：向量维度
 ) -> None:
     """
@@ -134,7 +162,6 @@ async def _initialize_agent_resources(
         saver (Any): 检查点保存器对象
         store (Any): 存储器对象
         qdrant_client (Any): Qdrant客户端实例
-        existing_collections (set[str]): 已存在的集合名称集合
         vector_size int:  新增参数：向量维度
     """
     try:
@@ -175,11 +202,7 @@ async def lifespan(app) -> AsyncGenerator[None, None]:
     Yields:
         None: 生命周期管理器不产生任何值，仅用于管理资源生命周期
     """
-    # 使用自定义 get_logger 静默第三方库的 DEBUG 日志，防止刷屏
-    # get_logger("httpcore").setLevel(logging.WARNING)
-    # get_logger("httpx").setLevel(logging.WARNING)
-    # get_logger("openai").setLevel(logging.WARNING)
-    # get_logger("urllib3").setLevel(logging.WARNING)
+    # Logging configuration is handled in core/__init__.py at import time
 
     async with AsyncExitStack() as stack:
         try:
@@ -190,13 +213,10 @@ async def lifespan(app) -> AsyncGenerator[None, None]:
             
             # 初始化 Qdrant 客户端
             qdrant_client = await stack.enter_async_context(get_qdrant_client())
-            existing_collections = await _get_existing_collections(qdrant_client)
 
-            # --- 确保全局向量集合 'agent_conversations' 存在 ---
-            await _ensure_qdrant_collection(
-                "agent_conversations",
+            # --- 确保所有向量集合（包括 agent_conversations 和 KB）维度正确 ---
+            await _sync_all_qdrant_collections(
                 qdrant_client,
-                existing_collections,
                 vector_size=vector_size,
             )
 
@@ -212,7 +232,6 @@ async def lifespan(app) -> AsyncGenerator[None, None]:
                     saver,
                     store,
                     qdrant_client,
-                    existing_collections,
                     vector_size
                 )
                 

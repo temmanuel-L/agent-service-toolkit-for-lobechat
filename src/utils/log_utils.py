@@ -23,8 +23,16 @@ except ModuleNotFoundError:
     log_dir = project_root / "log"
     os.makedirs(log_dir, exist_ok=True)
 
-_log_level = "DEBUG"
-# _log_level = "INFO"
+# 从 settings 读取日志级别，实现统一的日志级别控制
+# 在 .env 中设置 LOG_LEVEL=DEBUG/INFO/WARNING/ERROR 来控制日志输出
+def _get_log_level() -> str:
+    """获取日志级别，优先从 settings 读取"""
+    try:
+        from core.settings import settings
+        return settings.LOG_LEVEL.value.upper()
+    except Exception:
+        # 如果 settings 不可用（如启动早期），使用默认值
+        return os.environ.get("LOG_LEVEL", "INFO").upper()
 
 
 class Logger:
@@ -36,9 +44,10 @@ class Logger:
         self.log_path = path
         self.log_file_name = "agent_local.log"  # 日志文件
         self.backup_count = 14  # 保留的日志数量
-        # 日志输出级别
-        self.console_output_level = _log_level
-        self.file_output_level = _log_level
+        # 日志输出级别 - 从环境变量或 settings 动态获取
+        log_level = _get_log_level()
+        self.console_output_level = log_level
+        self.file_output_level = log_level
         # 设置 logger 自身的级别，否则 INFO 级别的日志可能被默认的 WARNING 级别过滤掉
         self._logger.setLevel(self.console_output_level)
         # 日志输出格式

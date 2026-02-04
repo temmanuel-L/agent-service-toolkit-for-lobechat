@@ -1,123 +1,59 @@
-from datetime import datetime
-from typing import Literal, List
+"""
+RAG 知识库助手智能体
 
-from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage, SystemMessage, HumanMessage
-from langchain_core.runnables import (
-    RunnableConfig,
-)
+这是一个简洁的 RAG 智能体示例，演示如何使用 /src/rag 模块快速构建
+具有知识库检索能力的智能体。
+
+所有 RAG 相关的通用逻辑（语言检测、提示词生成、回退机制等）
+都已封装在 /src/rag 模块中，智能体只需专注于图的编排。
+"""
+from typing import Literal
+
+from langchain_core.messages import AIMessage
 from langgraph.graph import END, MessagesState, StateGraph
 from langgraph.managed import RemainingSteps
 from langgraph.prebuilt import ToolNode
 
-from agents.llama_guard import LlamaGuard, LlamaGuardOutput, SafetyAssessment
-from rag.tools import SearchKnowledgeTool
-from rag.service import rag_service
-from core import get_model, settings
+# 导入通用 RAG 模块
+from rag import SearchKnowledgeTool, create_rag_model_node, pending_tool_calls
 
+
+# ============================================================================
+# 状态定义
+# ============================================================================
 
 class AgentState(MessagesState, total=False):
-    """`total=False` is PEP589 specs."""
-    safety: LlamaGuardOutput
+    """RAG 智能体状态"""
     remaining_steps: RemainingSteps
-    kb_context: str  # To store retrieved context
 
+
+# ============================================================================
+# 工具配置
+# ============================================================================
 
 tools = [SearchKnowledgeTool()]
 
 
-def get_instructions(kb_ids: List[str] = None) -> str:
-    current_date = datetime.now().strftime("%B %d, %Y")
-    kb_info = f"Available Knowledge Base IDs: {', '.join(kb_ids)}" if kb_ids else "No specific knowledge bases associated."
-    base = f"""
-    You are a professional assistant with access to a knowledge base. 
-    Today's date is {current_date}.
-    {kb_info}
+# ============================================================================
+# 图定义 - 这就是智能体的核心，专注于编排
+# ============================================================================
 
-    Your goal is to answer user questions accurately by retrieving information from the knowledge base using the `search_knowledge` tool.
-    
-    GUIDELINES:
-    1. ALWAYS use the `search_knowledge` tool if the user asks a question that requires factual information from the knowledge base.
-    2. Once you have the search results, synthesize an answer that directly addresses the user's query. 
-    3. DO NOT simply output the raw search results. Provide a coherent, natural language response.
-    4. If the search results do not contain the answer, explain what you found and what is missing.
-    5. Cite your sources if the context provides document names or IDs.
-    6. Be concise and professional.
-    """
-    return base
-
-
-async def acall_model(state: AgentState, config: RunnableConfig) -> AgentState:
-    # 1. Get KB IDs from configuration
-    kb_ids = config["configurable"].get("kb_ids") or []
-    
-    # 2. Setup model and tools
-    # We no longer perform automatic retrieval here to avoid redundant calls and overwhelming context.
-    # The agent will use the search_knowledge tool as needed.
-    m = get_model(config["configurable"].get("model", settings.DEFAULT_MODEL))
-    bound_model = m.bind_tools(tools)
-    
-    # 3. Prepare messages with instructions
-    system_msg = SystemMessage(content=get_instructions(kb_ids))
-    messages = [system_msg] + state["messages"]
-    
-    response = await bound_model.with_config(tags=["skip_stream"]).ainvoke(messages, config)
-
-    # 5. Safety Check
-    llama_guard = LlamaGuard()
-    safety_output = await llama_guard.ainvoke("Agent", state["messages"] + [response])
-    if safety_output.safety_assessment == SafetyAssessment.UNSAFE:
-        return {
-            "messages": [AIMessage(content=f"This conversation was flagged for unsafe content: {', '.join(safety_output.unsafe_categories)}")],
-            "safety": safety_output,
-        }
-
-    if state["remaining_steps"] < 2 and response.tool_calls:
-        return {
-            "messages": [AIMessage(id=response.id, content="Sorry, need more steps to process this request.")]
-        }
-        
-    return {"messages": [response]}
-
-
-async def llama_guard_input(state: AgentState, config: RunnableConfig) -> AgentState:
-    llama_guard = LlamaGuard()
-    safety_output = await llama_guard.ainvoke("User", state["messages"])
-    return {"safety": safety_output}
-
-
-async def block_unsafe_content(state: AgentState, config: RunnableConfig) -> AgentState:
-    safety: LlamaGuardOutput = state["safety"]
-    content = f"This conversation was flagged for unsafe content: {', '.join(safety.unsafe_categories)}"
-    return {"messages": [AIMessage(content=content)]}
-
-
-# Define the graph
 agent = StateGraph(AgentState)
-agent.add_node("model", acall_model)
+
+# 添加节点 - 使用通用 RAG 模型节点
+agent.add_node("model", create_rag_model_node(tools=tools, safety_check=True))
 agent.add_node("tools", ToolNode(tools))
-agent.add_node("guard_input", llama_guard_input)
-agent.add_node("block_unsafe_content", block_unsafe_content)
-agent.set_entry_point("guard_input")
 
-def check_safety(state: AgentState) -> Literal["unsafe", "safe"]:
-    safety: LlamaGuardOutput = state.get("safety")
-    if safety and safety.safety_assessment == SafetyAssessment.UNSAFE:
-        return "unsafe"
-    return "safe"
+# 设置入口
+agent.set_entry_point("model")
 
+# 定义边
 agent.add_conditional_edges(
-    "guard_input", check_safety, {"unsafe": "block_unsafe_content", "safe": "model"}
+    "model",
+    pending_tool_calls,
+    {"tools": "tools", "done": END}
 )
-agent.add_edge("block_unsafe_content", END)
 agent.add_edge("tools", "model")
 
-def pending_tool_calls(state: AgentState) -> Literal["tools", "done"]:
-    last_message = state["messages"][-1]
-    if isinstance(last_message, AIMessage) and last_message.tool_calls:
-        return "tools"
-    return "done"
-
-agent.add_conditional_edges("model", pending_tool_calls, {"tools": "tools", "done": END})
-
+# 编译
 rag_assistant = agent.compile()

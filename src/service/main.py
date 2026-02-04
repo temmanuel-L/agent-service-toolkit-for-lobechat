@@ -293,12 +293,12 @@ async def openai_chat_completions(
         Any: OpenAI格式的聊天完成响应
     """
 
-    # ======== 详细记录所有请求信息 ========
-    logger.info("=== 请求开始 ===")
+    # ======== 记录请求概要信息（INFO级别）========
+    logger.info(f"=== 请求开始: model={request.model}, messages={len(request.messages) if request.messages else 0} ===")
 
-    # 记录完整的请求体
-    logger.info("=== 完整请求体 ===")
-    logger.info(json.dumps({
+    # ======== 详细记录所有请求信息（DEBUG级别）========
+    logger.debug("=== 完整请求体 ===")
+    logger.debug(json.dumps({
         "model": request.model,
         "stream": getattr(request, 'stream', None),
         "temperature": getattr(request, 'temperature', None),
@@ -308,27 +308,27 @@ async def openai_chat_completions(
         "messages_count": len(request.messages) if request.messages else 0,
         "user": request.user,
         "topicId": getattr(request, 'topicId', None),
-        "kb_ids": getattr(request, 'kb_ids', None),  # 新增：记录 kb_ids
+        "kb_ids": getattr(request, 'kb_ids', None),
         "messages": [
             {"role": msg.get("role"), "content": str(msg.get("content", ""))[:200]}
-            for msg in (request.messages or [])[-5:]  # 只打印前5条消息的前200字符
+            for msg in (request.messages or [])[-5:]
         ]
     }, ensure_ascii=False, indent=2))
-    logger.info("=== 完整请求体结束 ===")
+    logger.debug("=== 完整请求体结束 ===")
 
-    # 记录完整的请求头
-    logger.info("=== 完整请求头 ===")
+    # 记录完整的请求头（DEBUG级别）
+    logger.debug("=== 完整请求头 ===")
     for header_name, header_value in raw_request.headers.items():
-        logger.info(f"Header: {header_name} = {header_value}")
-    logger.info("=== 完整请求头结束 ===")
+        logger.debug(f"Header: {header_name} = {header_value}")
+    logger.debug("=== 完整请求头结束 ===")
 
     # ======== 从各种来源获取 thread_id ========
-    logger.info("=== 获取 thread_id 的过程 ===")
+    logger.debug("=== 获取 thread_id 的过程 ===")
 
     # 1. 从请求体中获取 topicId（主要来源）
     topicId_from_body = getattr(request, 'topicId', None)
     if topicId_from_body:
-        logger.info(f"✅ 从请求体获取 topicId: {topicId_from_body}")
+        logger.debug(f"从请求体获取 topicId: {topicId_from_body}")
 
     # 2. 从 X-lobe-trace 头部解析 topicId（备用方案）
     x_lobe_trace = raw_request.headers.get('x-lobe-trace')
@@ -339,49 +339,49 @@ async def openai_chat_completions(
             decoded_trace = base64.b64decode(x_lobe_trace).decode('utf-8')
             trace_data = json.loads(decoded_trace)
             extracted_topic_id = trace_data.get('topicId')
-            logger.info(f"✅ 从 X-lobe-trace 解析出 topicId: {extracted_topic_id}")
+            logger.debug(f"从 X-lobe-trace 解析出 topicId: {extracted_topic_id}")
         except Exception as e:
-            logger.warning(f"⚠️ 解析 X-lobe-trace 失败: {str(e)}")
+            logger.debug(f"解析 X-lobe-trace 失败: {str(e)}")
             pass
 
     # 3. 从 x-thread-id 头部获取 thread_id（备用方案）
     x_thread_id = raw_request.headers.get('x-thread-id')
     if x_thread_id:
-        logger.info(f"✅ 从 x-thread-id 头部获取: {x_thread_id}")
+        logger.debug(f"从 x-thread-id 头部获取: {x_thread_id}")
 
     # 4. 从 user_id 头部获取（作为备用）
     user_id_header = raw_request.headers.get('user-id')
     if user_id_header:
-        logger.info(f"✅ 从 user-id 头部获取: {user_id_header}")
+        logger.debug(f"从 user-id 头部获取: {user_id_header}")
 
     # 5. 从 x-user-id 头部获取（作为备用）
     x_user_id = raw_request.headers.get('x-user-id')
     if x_user_id:
-        logger.info(f"✅ 从 x-user-id 头部获取: {x_user_id}")
+        logger.debug(f"从 x-user-id 头部获取: {x_user_id}")
 
     # ======== 确定最终的 thread_id ========
     # 优先级：请求体中的 topicId > x-thread-id > 从 X-lobe-trace 解析的 topicId > user-id > x-user-id
     effective_thread_id = topicId_from_body or x_thread_id or extracted_topic_id or user_id_header or x_user_id or None
 
     if effective_thread_id:
-        logger.info(f"✅ 最终确定的 thread_id: {effective_thread_id}")
+        logger.debug(f"最终确定的 thread_id: {effective_thread_id}")
     else:
-        logger.warning("⚠️ 未找到有效的 thread_id，将使用 None")
+        logger.debug("未找到有效的 thread_id，将使用 None")
 
-    logger.info("=== 获取 thread_id 的过程结束 ===")
+    logger.debug("=== 获取 thread_id 的过程结束 ===")
 
     # ======== 确定 user_id ========
     # 根据你的建议，user_id 直接使用 request.user
     effective_user_id = request.user if hasattr(request, 'user') and request.user else None
 
     if effective_user_id:
-        logger.info(f"✅ 最终确定的 user_id: {effective_user_id}")
+        logger.debug(f"最终确定的 user_id: {effective_user_id}")
     else:
-        logger.warning("⚠️ 未找到有效的 user_id，将使用 None")
+        logger.debug("未找到有效的 user_id，将使用 None")
 
     # ======== 调用处理函数 ========
-    logger.info("=== 调用 chat_completions_handler ===")
-    logger.info(
+    logger.debug("=== 调用 chat_completions_handler ===")
+    logger.debug(
         f"参数: request={type(request)}, agent_id={request.model}, user_id={effective_user_id}, thread_id={effective_thread_id}")
 
     # 将 request.model 作为 agent_id 传递
@@ -389,7 +389,7 @@ async def openai_chat_completions(
 
     result = await chat_completions_handler(request, agent_id, effective_user_id, effective_thread_id)
 
-    logger.info("=== chat_completions_handler 调用完成 ===")
+    logger.debug("=== chat_completions_handler 调用完成 ===")
     logger.info("=== 请求结束 ===")
 
     return result
