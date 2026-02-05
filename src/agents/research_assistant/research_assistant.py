@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Literal
 
-from langchain_community.tools import DuckDuckGoSearchResults, OpenWeatherMapQueryRun
+from langchain_community.tools import OpenWeatherMapQueryRun
 from langchain_community.utilities import OpenWeatherMapAPIWrapper
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, SystemMessage
@@ -11,7 +11,7 @@ from langgraph.managed import RemainingSteps
 from langgraph.prebuilt import ToolNode
 
 from agents.llama_guard import LlamaGuard, LlamaGuardOutput, SafetyAssessment
-from agents.tools import calculator, vector_search_tool
+from agents.tools import calculator, vector_search_tool, web_search
 from core import get_model, settings
 from utils.log_utils import get_logger
 
@@ -19,50 +19,19 @@ logger = get_logger(__name__)
 
 
 class AgentState(MessagesState, total=False):
-    """`total=False` is PEP589 specs.
+    """`total=False` 来自 PEP589（TypedDict）规范。
 
-    documentation: https://typing.readthedocs.io/en/latest/spec/typeddict.html#totality
+    文档： https://typing.readthedocs.io/en/latest/spec/typeddict.html#totality
     """
 
     safety: LlamaGuardOutput
     remaining_steps: RemainingSteps
 
 
-class FormattedDuckDuckGoSearchResults(DuckDuckGoSearchResults):
-    def _run(self, query: str, run_manager=None) -> str | tuple:
-        """Use the tool."""
-        # 直接使用 api_wrapper 获取结构化数据，而不是解析字符串
-        try:
-            results = self.api_wrapper.results(query, self.max_results)
-            if not results:
-                return "No results found."
-                
-            formatted_results = []
-            for res in results:
-                title = res.get("title", "No Title")
-                link = res.get("link", "")
-                snippet = res.get("snippet", "")
-                
-                # 构建 Markdown 格式
-                formatted_results.append(f"### [{title}]({link})\n> {snippet}")
-            
-            # 构建 Markdown 格式
-            formatted_res = "\n\n".join(formatted_results)
-            
-            # 兼容 content_and_artifact 格式(lobe-chat)
-            if getattr(self, "response_format", None) == "content_and_artifact":
-                return formatted_res, results
-                
-            return formatted_res
-        except Exception as e:
-            # 如果出错，回退到默认行为
-            return super()._run(query, run_manager)
-
-web_search = FormattedDuckDuckGoSearchResults(name="WebSearch")
 tools = [web_search, calculator, vector_search_tool]
 
-# Add weather tool if API key is set
-# Register for an API key at https://openweathermap.org/api/
+# 若配置了 API Key，则添加天气工具
+# 申请 API Key： https://openweathermap.org/api/
 if settings.OPENWEATHERMAP_API_KEY:
     wrapper = OpenWeatherMapAPIWrapper(
         openweathermap_api_key=settings.OPENWEATHERMAP_API_KEY.get_secret_value()
@@ -71,16 +40,16 @@ if settings.OPENWEATHERMAP_API_KEY:
 
 current_date = datetime.now().strftime("%B %d, %Y")
 instructions = f"""
-    You are a helpful research assistant with the ability to search the web and use other tools.
-    Today's date is {current_date}.
+    你是一位乐于助人的研究助手，能够进行网页搜索并使用其他工具。
+    今天的日期是 {current_date}。
 
-    NOTE: THE USER CAN SEE THE TOOL RESPONSE AND EXECUTION STEPS.
+    注意：用户可以看到工具的返回结果与执行步骤。
 
-    A few things to remember:
-    - Please include markdown-formatted links to any citations used in your response. Only include one
-    or two citations per response unless more are needed. ONLY USE LINKS RETURNED BY THE TOOLS.
-    - Use calculator tool with numexpr to answer math questions. The user does not understand numexpr,
-      so for the final response, use human readable format - e.g. "300 * 200", not "(300 \\times 200)".
+    请牢记：
+    - 在回答中加入用于引用的 Markdown 链接。除非确有必要，否则每次回答只给 1-2 个引用。
+      只允许使用工具返回的链接。
+    - 使用 calculator（numexpr）工具回答数学问题。用户不理解 numexpr，最终回复请用人类可读格式，
+      例如写成 "300 * 200"，不要写成 "(300 \\times 200)"。
     """
 
 
@@ -95,7 +64,7 @@ def wrap_model(model: BaseChatModel) -> RunnableSerializable[AgentState, AIMessa
 
 def format_safety_message(safety: LlamaGuardOutput) -> AIMessage:
     content = (
-        f"This conversation was flagged for unsafe content: {', '.join(safety.unsafe_categories)}"
+        f"本对话被标记为不安全内容：{', '.join(safety.unsafe_categories)}"
     )
     return AIMessage(content=content)
 
@@ -105,7 +74,7 @@ async def acall_model(state: AgentState, config: RunnableConfig) -> AgentState:
     model_runnable = wrap_model(m)
     response = await model_runnable.ainvoke(state, config)
 
-    # Run llama guard check here to avoid returning the message if it's unsafe
+    # 在此处运行 llama guard，避免返回不安全内容
     llama_guard = LlamaGuard()
     safety_output = await llama_guard.ainvoke("Agent", state["messages"] + [response])
     if safety_output.safety_assessment == SafetyAssessment.UNSAFE:
@@ -116,11 +85,11 @@ async def acall_model(state: AgentState, config: RunnableConfig) -> AgentState:
             "messages": [
                 AIMessage(
                     id=response.id,
-                    content="Sorry, need more steps to process this request.",
+                    content="抱歉，需要更多步骤才能处理该请求。",
                 )
             ]
         }
-    # We return a list, because this will get added to the existing list
+    # 这里返回列表，因为它会被追加到现有消息列表中
     return {"messages": [response]}
 
 
@@ -135,7 +104,7 @@ async def block_unsafe_content(state: AgentState, config: RunnableConfig) -> Age
     return {"messages": [format_safety_message(safety)]}
 
 
-# Define the graph
+# 定义图
 agent = StateGraph(AgentState)
 agent.add_node("model", acall_model)
 agent.add_node("tools", ToolNode(tools))
@@ -144,7 +113,7 @@ agent.add_node("block_unsafe_content", block_unsafe_content)
 agent.set_entry_point("guard_input")
 
 
-# Check for unsafe input and block further processing if found
+# 检测不安全输入，若命中则阻断后续处理
 def check_safety(state: AgentState) -> Literal["unsafe", "safe"]:
     safety: LlamaGuardOutput = state["safety"]
     match safety.safety_assessment:
@@ -158,14 +127,14 @@ agent.add_conditional_edges(
     "guard_input", check_safety, {"unsafe": "block_unsafe_content", "safe": "model"}
 )
 
-# Always END after blocking unsafe content
+# 阻断不安全内容后直接结束
 agent.add_edge("block_unsafe_content", END)
 
-# Always run "model" after "tools"
+# tools 执行后总是回到 model
 agent.add_edge("tools", "model")
 
 
-# After "model", if there are tool calls, run "tools". Otherwise END.
+# model 执行后：若存在工具调用则运行 tools，否则结束
 def pending_tool_calls(state: AgentState) -> Literal["tools", "done"]:
     last_message = state["messages"][-1]
     if not isinstance(last_message, AIMessage):
