@@ -5,7 +5,7 @@
 @File ：simple_travel_planner_agent.py
 @IDE ：PyCharm
 
-Refactored to use LLM-based extraction with tool calling and smart routing.
+已重构为基于 LLM 的信息抽取，配合工具调用与智能路由。
 """
 
 import uuid
@@ -27,10 +27,10 @@ logger = get_logger(__name__)
 
 
 # =============================================================================
-# State Definition
+# 状态定义
 # =============================================================================
 class PlannerState(MessagesState, total=False):
-    """Planner State with optional fields for collected information."""
+    """规划器状态，包含可选的已收集信息字段。"""
     destination: Optional[str]
     interests: Optional[List[str]]
     itinerary: Optional[str]
@@ -38,27 +38,25 @@ class PlannerState(MessagesState, total=False):
 
 
 # =============================================================================
-# Extraction Schema - The key to LLM-powered information gathering
+# 抽取模式 - LLM 驱动信息收集的关键
 # =============================================================================
 class TravelInfoExtraction(BaseModel):
-    """Extract travel planning information from user message.
+    """从用户消息中抽取旅行规划信息。
     
-    This schema is used as a tool for the LLM to extract structured data.
+    该模式作为工具供 LLM 抽取结构化数据。
     """
     destination: Optional[str] = Field(
         default=None,
-        description="The city, country or place the user wants to travel to. "
-                    "Extract only if explicitly mentioned."
+        description="用户想要前往的城市、国家或地点。仅在明确提及时抽取。"
     )
     interests: Optional[List[str]] = Field(
         default=None,
-        description="List of user interests for the trip (e.g., food, history, nature, play field, shopping center, etc.). "
-                    "Extract as a list only if mentioned."
+        description="用户对本次旅行的兴趣列表（如：美食、历史、自然、游乐园、购物中心等）。仅在提及时以列表形式抽取。"
     )
 
 
 # =============================================================================
-# Required Fields Configuration - Easy to extend
+# 必填字段配置 - 便于扩展
 # =============================================================================
 REQUIRED_FIELDS = ["destination", "interests"]
 
@@ -69,11 +67,11 @@ FIELD_PROMPTS = {
 
 
 def get_missing_fields(state: PlannerState) -> List[str]:
-    """Check which required fields are still missing or empty."""
+    """检查哪些必填字段仍缺失或为空。"""
     missing = []
     for required_field in REQUIRED_FIELDS:
         value = state.get(required_field)
-        # Consider empty lists as missing too
+        # 空列表也视为缺失
         if value is None or (isinstance(value, list) and len(value) == 0):
             missing.append(required_field)
     logger.info(f'缺失字段为：{missing}')
@@ -81,13 +79,13 @@ def get_missing_fields(state: PlannerState) -> List[str]:
 
 
 # =============================================================================
-# Few-shot Examples for Tool Calling
+# 工具调用的 Few-shot 示例
 # =============================================================================
 def _build_tool_call_example(
         user_input: str,
         destination: Optional[str],
         interests: Optional[List[str]]) -> List:
-    """Build a single few-shot example with proper tool_calls format."""
+    """构建一个符合 tool_calls 格式的 few-shot 示例。"""
     tool_call_id = str(uuid.uuid4())
     return [
         HumanMessage(content=user_input),
@@ -101,23 +99,23 @@ def _build_tool_call_example(
 
 
 def _get_extraction_examples() -> List:
-    """Build all few-shot examples."""
+    """构建所有 few-shot 示例。"""
     examples = []
-    # Example 1: destination only
+    # 示例 1：仅目的地
     examples.extend(_build_tool_call_example("我想去北京", "北京", None))
-    # Example 2: interests only
+    # 示例 2：仅兴趣
     examples.extend(_build_tool_call_example("我喜欢历史古迹和美食", None, ["历史古迹", "美食"]))
-    # Example 3: interests (specific places)
+    # 示例 3：兴趣（具体地点）
     examples.extend(_build_tool_call_example("去看故宫和长城", None, ["故宫", "长城"]))
-    # Example 4: nothing to extract
+    # 示例 4：无信息可抽取
     examples.extend(_build_tool_call_example("你好", None, None))
     return examples
 
 
-# Pre-build examples once
+# 预构建示例（只构建一次）
 EXTRACTION_EXAMPLES = _get_extraction_examples()
 
-# System prompt
+# 系统提示
 EXTRACTION_SYSTEM_PROMPT = """你是一个信息提取助手。你的任务是从用户消息中提取旅行规划信息。
 
 规则：
@@ -128,21 +126,21 @@ EXTRACTION_SYSTEM_PROMPT = """你是一个信息提取助手。你的任务是�
 
 
 # =============================================================================
-# Node: Extract Information using LLM + Tool Calling
+# 节点：使用 LLM + 工具调用抽取信息
 # =============================================================================
 async def extract_info(state: PlannerState, config: RunnableConfig) -> dict:
-    """Extract travel information from the latest user message using LLM with tool calling."""
-    logger.info(f"--- [EXTRACT INFO] Remaining steps: {state.get('remaining_steps')} ---")
+    """使用 LLM 与工具调用从最新用户消息中抽取旅行信息。"""
+    logger.info(f"--- [抽取信息] 剩余步数: {state.get('remaining_steps')} ---")
     messages = state.get("messages", [])
     if not messages:
         logger.info("No messages to extract from, skipping extraction")
         return {}
     
-    # Get the model and bind the extraction tool
+    # 获取模型并绑定抽取工具
     llm = get_model(config["configurable"].get("model", settings.DEFAULT_MODEL))
     llm_with_tools = llm.bind_tools([TravelInfoExtraction])
     
-    # Prompt with examples placeholder
+    # 带示例占位符的提示
     extraction_prompt = ChatPromptTemplate.from_messages([
         ("system", EXTRACTION_SYSTEM_PROMPT),
         MessagesPlaceholder(variable_name="examples"),
@@ -157,7 +155,7 @@ async def extract_info(state: PlannerState, config: RunnableConfig) -> dict:
             break
     
     if not last_human_msg:
-        logger.info("No human message found, skipping extraction")
+        logger.info("未找到用户消息，跳过抽取")
         return {}
     
     logger.info(f"Extracting info from: {last_human_msg}")
@@ -170,14 +168,14 @@ async def extract_info(state: PlannerState, config: RunnableConfig) -> dict:
         )
         response = await llm_with_tools.with_config(tags=["skip_stream"]).ainvoke(formatted_messages, config)
         
-        # Parse tool calls to get extracted data
+        # 解析工具调用以得到抽取结果
         if response.tool_calls:
             tool_call = response.tool_calls[0]
             args = tool_call["args"]
             
             # Auto-correction: If destination is a list, move it to interests
             if isinstance(args.get("destination"), list):
-                logger.warning(f"LLM put list in destination field, auto-correcting: {args['destination']}")
+                logger.warning(f"LLM 将列表填入了 destination 字段，自动修正: {args['destination']}")
                 if not args.get("interests"):
                     args["interests"] = args["destination"]
                 args["destination"] = None
@@ -185,11 +183,10 @@ async def extract_info(state: PlannerState, config: RunnableConfig) -> dict:
             extracted = TravelInfoExtraction(**args)
             logger.info(f"Extracted: destination={extracted.destination}, interests={extracted.interests}")
             
-            # Build update dict
+            # 构建状态更新字典
             updates = {}
             
-            # 1. State-aware Destination Logic: 
-            # If destination already exists, any new extracted destination is demoted to interests
+            # 1. 状态感知的目的地逻辑：若已有目的地，新抽取的目的地降级为兴趣
             if extracted.destination:
                 if not state.get("destination"):
                     updates["destination"] = extracted.destination
@@ -200,29 +197,28 @@ async def extract_info(state: PlannerState, config: RunnableConfig) -> dict:
                     if extracted.destination not in extracted.interests:
                         extracted.interests.append(extracted.destination)
             
-            # 2. Cumulative Interests Logic:
-            # Merge newly extracted interests with existing ones (avoid duplicates)
+            # 2. 兴趣累加逻辑：将新抽取的兴趣与已有兴趣合并（去重）
             if extracted.interests:
                 existing_interests = state.get("interests") or []
-                # Use dict.fromkeys to maintain order and remove duplicates
+                # 用 dict.fromkeys 保持顺序并去重
                 merged_interests = list(dict.fromkeys(existing_interests + extracted.interests))
                 updates["interests"] = merged_interests
             
             return updates
         else:
-            logger.warning("LLM did not return tool calls, trying to parse content")
+            logger.warning("LLM 未返回工具调用，尝试解析内容")
             return {}
             
     except Exception as e:
-        logger.error(f"Extraction failed: {e}")
+        logger.error(f"抽取失败: {e}")
         return {}
 
 
 # =============================================================================
-# Node: Ask for Missing Information
+# 节点：询问缺失信息
 # =============================================================================
 def ask_missing_info(state: PlannerState, config: RunnableConfig) -> dict:
-    """Dynamically ask for missing required fields using interrupt."""
+    """通过 interrupt 动态询问缺失的必填字段。"""
     logger.info(f"--- [ASK MISSING] Remaining steps: {state.get('remaining_steps')} ---")
     missing_fields = get_missing_fields(state)
     
@@ -233,11 +229,11 @@ def ask_missing_info(state: PlannerState, config: RunnableConfig) -> dict:
     prompts = [f"{i+1}. {FIELD_PROMPTS.get(f, f'请提供{f}')}" for i, f in enumerate(missing_fields)]
     combined_prompt = "为了帮您规划旅行，我需要了解以下信息：\n" + "\n".join(prompts)
     
-    logger.info(f"Asking for missing fields: {missing_fields}, prompt: {combined_prompt}")
+    logger.info(f"正在询问缺失字段: {missing_fields}, 提示: {combined_prompt}")
     
-    # Interrupt to get user input
+    # 通过 interrupt 获取用户输入
     user_response = interrupt(combined_prompt)
-    logger.info(f"User response: {user_response}")
+    logger.info(f"用户回复: {user_response}")
     
     return {
         "messages": [HumanMessage(content=user_response)]
@@ -245,7 +241,7 @@ def ask_missing_info(state: PlannerState, config: RunnableConfig) -> dict:
 
 
 # =============================================================================
-# Node: Create Itinerary
+# 节点：创建行程
 # =============================================================================
 itinerary_prompt = ChatPromptTemplate.from_messages([
     ("system", 
@@ -259,12 +255,12 @@ itinerary_prompt = ChatPromptTemplate.from_messages([
 
 async def create_itinerary(state: PlannerState, config: RunnableConfig) -> dict:
     """Generate the travel itinerary using the LLM."""
-    logger.info(f"--- [CREATE ITINERARY] Remaining steps: {state.get('remaining_steps')} ---")
+    logger.info(f"--- [创建行程] 剩余步数: {state.get('remaining_steps')} ---")
     destination = state.get("destination", "未知目的地")
     interests = state.get("interests", [])
     interests_str = ", ".join(interests) if interests else "未指定"
     
-    logger.info(f"Creating itinerary: destination={destination}, interests={interests_str}")
+    logger.info(f"正在创建行程: destination={destination}, interests={interests_str}")
     
     llm = get_model(config["configurable"].get("model", settings.DEFAULT_MODEL))
     current_date = datetime.now().strftime("%Y年%m月%d日")
@@ -276,7 +272,7 @@ async def create_itinerary(state: PlannerState, config: RunnableConfig) -> dict:
     )
     
     try:
-        # Streaming enabled - handlers.py has dedup logic to prevent duplicate messages
+        # 已开启流式输出，handlers.py 中有去重逻辑避免重复消息
         response = await llm.ainvoke(formatted_messages, config)
         itinerary_content = response.content
         
@@ -296,39 +292,39 @@ async def create_itinerary(state: PlannerState, config: RunnableConfig) -> dict:
     return {
         "messages": [AIMessage(content=itinerary_content)],
         "itinerary": itinerary_content,
-        # Reset for next trip
+        # 为下一次行程重置
         "destination": None,
         "interests": None,
     }
 
 
 # =============================================================================
-# Routing Logic - Smart completeness check
+# 路由逻辑 - 基于完整性的智能判断
 # =============================================================================
 def route_by_completeness(state: PlannerState) -> Literal["complete", "incomplete"]:
-    """Route based on whether all required fields are filled."""
+    """根据必填字段是否已全部填写进行路由。"""
     missing = get_missing_fields(state)
     if missing:
-        logger.info(f"Missing fields: {missing} -> incomplete")
+        logger.info(f"缺失字段: {missing} -> incomplete")
         return "incomplete"
-    logger.info("All fields complete -> ready to create itinerary")
+    logger.info("所有字段已完整 -> 可创建行程")
     return "complete"
 
 
 # =============================================================================
-# Graph Construction
+# 图构建
 # =============================================================================
 workflow = StateGraph(PlannerState)
 
-# Add nodes
+# 添加节点
 workflow.add_node("extract_info", extract_info)
 workflow.add_node("ask_missing", ask_missing_info)
 workflow.add_node("create_itinerary", create_itinerary)
 
-# Set entry point
+# 设置入口
 workflow.set_entry_point("extract_info")
 
-# Add edges with smart routing
+# 添加带智能路由的边
 workflow.add_conditional_edges(
     "extract_info",
     route_by_completeness,
@@ -338,13 +334,13 @@ workflow.add_conditional_edges(
     }
 )
 
-# After asking, go back to extraction to process the new input
+# 询问后回到抽取节点以处理新输入
 workflow.add_edge("ask_missing", "extract_info")
 
-# End after creating itinerary
+# 创建行程后结束
 workflow.add_edge("create_itinerary", END)
 
-# Compile the graph
+# 编译图
 simple_travel_planner_agent = workflow.compile().with_config({'recursion_limit': 10})
 
 try:
@@ -353,4 +349,4 @@ try:
     with open('state_graph_simple_travel_planner.png', 'wb') as f:
         f.write(pic)
 except Exception as e:
-    logger.warning(f"Failed to generate graph image: {e}")
+    logger.warning(f"生成图例失败: {e}")
