@@ -12,8 +12,8 @@ from agents.knowledge_base_agent import kb_agent
 from agents.langgraph_supervisor_agent import langgraph_supervisor_agent
 from agents.langgraph_supervisor_hierarchy_agent import langgraph_supervisor_hierarchy_agent
 from agents.lazy_agent import LazyLoadingAgent
-from agents.rag_assistant import rag_assistant
-from agents.research_assistant import research_assistant
+from agents.rag_assistant.rag_assistant import rag_assistant
+from agents.research_assistant.research_assistant import research_assistant
 from agents.simple_travel_planner_agent.simple_travel_planner_agent import simple_travel_planner_agent
 from agents.music_composer.music_composer import music_composer_agent
 from schema import AgentInfo

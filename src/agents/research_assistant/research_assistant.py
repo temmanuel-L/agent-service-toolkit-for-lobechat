@@ -13,6 +13,9 @@ from langgraph.prebuilt import ToolNode
 from agents.llama_guard import LlamaGuard, LlamaGuardOutput, SafetyAssessment
 from agents.tools import calculator, vector_search_tool
 from core import get_model, settings
+from utils.log_utils import get_logger
+
+logger = get_logger(__name__)
 
 
 class AgentState(MessagesState, total=False):
@@ -177,9 +180,10 @@ agent.add_conditional_edges("model", pending_tool_calls, {"tools": "tools", "don
 
 research_assistant = agent.compile()
 
-
-# if __name__ == '__main__':
+# try:
 #     graph_obj = research_assistant.get_graph()
 #     pic = graph_obj.draw_mermaid_png()
 #     with open('state_graph_research_assistant.png', 'wb') as f:
 #         f.write(pic)
+# except Exception as e:
+#     logger.warning(f"生成图例失败: {e}")

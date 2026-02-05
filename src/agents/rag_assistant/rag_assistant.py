@@ -7,15 +7,16 @@ RAG 知识库助手智能体
 所有 RAG 相关的通用逻辑（语言检测、提示词生成、回退机制等）
 都已封装在 /src/rag 模块中，智能体只需专注于图的编排。
 """
-from typing import Literal
 
-from langchain_core.messages import AIMessage
 from langgraph.graph import END, MessagesState, StateGraph
 from langgraph.managed import RemainingSteps
 from langgraph.prebuilt import ToolNode
 
 # 导入通用 RAG 模块
 from rag import SearchKnowledgeTool, create_rag_model_node, pending_tool_calls
+from utils.log_utils import get_logger
+
+logger = get_logger(__name__)
 
 
 # ============================================================================
@@ -57,3 +58,11 @@ agent.add_edge("tools", "model")
 
 # 编译
 rag_assistant = agent.compile()
+
+# try:
+#     graph_obj = rag_assistant.get_graph()
+#     pic = graph_obj.draw_mermaid_png()
+#     with open('state_graph_rag_assistant.png', 'wb') as f:
+#         f.write(pic)
+# except Exception as e:
+#     logger.warning(f"生成图例失败: {e}")

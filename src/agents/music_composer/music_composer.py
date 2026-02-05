@@ -796,12 +796,12 @@ workflow.add_edge("convert_to_midi", END)
 music_composer_agent = workflow.compile().with_config({'recursion_limit': 15})
 
 # 生成流程图（可选，用于调试）
-try:
-    graph_obj = music_composer_agent.get_graph()
-    pic = graph_obj.draw_mermaid_png()
-    graph_path = Path(__file__).parent / 'state_graph_music_composer.png'
-    with open(graph_path, 'wb') as f:
-        f.write(pic)
-    logger.info(f"流程图已保存: {graph_path}")
-except Exception as e:
-    logger.warning(f"无法生成流程图: {e}")
+# try:
+#     graph_obj = music_composer_agent.get_graph()
+#     pic = graph_obj.draw_mermaid_png()
+#     graph_path = Path(__file__).parent / 'state_graph_music_composer.png'
+#     with open(graph_path, 'wb') as f:
+#         f.write(pic)
+#     logger.info(f"流程图已保存: {graph_path}")
+# except Exception as e:
+#     logger.warning(f"无法生成流程图: {e}")
