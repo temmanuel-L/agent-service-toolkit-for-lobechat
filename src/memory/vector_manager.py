@@ -238,53 +238,6 @@ class VectorManager:
             )
         return await self.qdrant_store.asimilarity_search(query=query, k=k)
         
-    async def asimilarity_search_with_score(
-        self,
-        query: str,
-        user_id: Optional[str] = None,
-        thread_id: Optional[str] = None,
-        agent_id: Optional[str] = None,
-        k: int = 4,
-    ) -> List[tuple[Document, float]]:
-        """Perform similarity search and return docs with scores."""
-        if not self.qdrant_store:
-            await self.ainitialize()
-            
-        # 构建 Qdrant 过滤器（metadata 前缀）
-        conditions = []
-        if user_id:
-            conditions.append(
-                qdrant_models.FieldCondition(
-                    key="metadata.user_id",
-                    match=qdrant_models.MatchValue(value=user_id),
-                )
-            )
-        if thread_id:
-            conditions.append(
-                qdrant_models.FieldCondition(
-                    key="metadata.thread_id",
-                    match=qdrant_models.MatchValue(value=thread_id),
-                )
-            )
-        if agent_id:
-            conditions.append(
-                qdrant_models.FieldCondition(
-                    key="metadata.agent_id",
-                    match=qdrant_models.MatchValue(value=agent_id),
-                )
-            )
-
-        qdrant_filter = qdrant_models.Filter(must=conditions) if conditions else None
-        
-        # Qdrant client specific method for scores
-        if qdrant_filter is not None:
-             return await self.qdrant_store.asimilarity_search_with_score(
-                query=query,
-                k=k,
-                filter=qdrant_filter,
-            )
-        return await self.qdrant_store.asimilarity_search_with_score(query=query, k=k)
-        
     async def acleanup_user_data(self, user_id: str):
         """Clean up all vector data for a specific user."""
         if not self.qdrant_store:

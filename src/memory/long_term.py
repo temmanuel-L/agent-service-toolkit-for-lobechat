@@ -459,8 +459,8 @@ class MemoryManager:
         
         改进：
         - 内容验证：过滤损坏数据
-        - 相关性过滤：直接使用向量数据库返回的相似度分数
         - 去重：移除重复和高度相似的片段
+        - 相关性过滤：只保留与当前查询相关的片段
         """
         if not user_id or not query or not _backend_uses_vector():
             return []
@@ -468,41 +468,33 @@ class MemoryManager:
             return []
 
         k = top_k or settings.LONG_TERM_MEMORY_TOP_K
-        # Retrieve more candidates for filtering and dedup
-        retrieve_k = k * 3
+        # Retrieve more candidates for filtering
+        retrieve_k = k * 3  # Retrieve 3x to account for dedup and filtering
         
         start = time.perf_counter()
         try:
-            # [OPTIMIZATION] Directly get scores from Qdrant to avoid re-embedding for scoring
-            docs_with_scores = await self._vector_manager.asimilarity_search_with_score(
-                query=query, user_id=user_id, k=retrieve_k
-            )
+            docs = await self._vector_manager.asimilarity_search(query=query, user_id=user_id, k=retrieve_k)
         except Exception as exc:
             logger.warning("向量检索失败: user=%s elapsed=%.1fms err=%s", user_id, (time.perf_counter() - start) * 1000, exc)
             return []
 
-        # 1. Validate Content & Filter by Score
-        threshold = settings.LONG_TERM_MEMORY_MIN_RELEVANCE_SCORE
-        valid_snippets = []
-        
-        for doc, score in docs_with_scores:
-            # Score filter (Fast, no LLM call)
-            if score < threshold:
-                continue
-                
+        # Extract and validate content
+        snippets = []
+        for doc in docs:
             content = getattr(doc, "page_content", "") or ""
-            # Content validation check
             if _validate_content(content):
-                valid_snippets.append(_truncate(content, settings.LONG_TERM_MEMORY_MAX_ITEM_CHARS))
+                snippets.append(_truncate(content, settings.LONG_TERM_MEMORY_MAX_ITEM_CHARS))
         
-        logger.info("向量检索: user=%s raw_hits=%d valid_score=%d elapsed=%.1fms", 
-                    user_id, len(docs_with_scores), len(valid_snippets), (time.perf_counter() - start) * 1000)
+        logger.info("向量检索: user=%s raw_hits=%d valid=%d elapsed=%.1fms", 
+                    user_id, len(docs), len(snippets), (time.perf_counter() - start) * 1000)
         
-        # 2. Deduplication (Semantic)
-        # This still requires one batch embedding call, but it's much faster than per-item scoring
-        snippets = await self._deduplicate_snippets(valid_snippets)
+        # Deduplication
+        snippets = await self._deduplicate_snippets(snippets)
         
-        # Return top-k
+        # Relevance filtering
+        snippets = await self._filter_by_relevance(snippets, query)
+        
+        # Return top-k after filtering
         return snippets[:k]
 
     # ---- 公共 API ----
