@@ -295,6 +295,16 @@ async def openai_chat_completions(
 
     # ======== 记录请求概要信息（INFO级别）========
     logger.info(f"=== 请求开始: model={request.model}, messages={len(request.messages) if request.messages else 0} ===")
+    
+    # ======== [CRITICAL] 短期记忆（对话历史）过滤 ========
+    # 防止前端传递的对话历史中包含已污染的死循环文本（如 "A. A. A..."）
+    # 如果检测到低质量消息，直接从历史中剔除，防止 LLM 被带偏
+    if request.messages:
+        request.messages = handlers.sanitize_chat_history(request.messages)
+
+    kb_ids = getattr(request, "kb_ids", None)
+    if kb_ids is not None:
+        logger.info(f"请求携带 kb_ids: {kb_ids}")
 
     # ======== 详细记录所有请求信息（DEBUG级别）========
     logger.debug("=== 完整请求体 ===")

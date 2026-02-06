@@ -153,7 +153,7 @@ async def conversations_handler(input: ConversationInput) -> list[ConversationsL
         title = "新对话"
         if store:
             try:
-                async with get_postgres_store(input.agent) as store:
+                async with get_postgres_store() as store:
                     topic_obj = await store.aget(
                         namespace=(input.user_id, "conversation_topic"), key=thread_id
                     )

@@ -87,6 +87,7 @@ class OllamaModelName(StrEnum):
     """https://ollama.com/search"""
 
     OLLAMA_GENERIC = "alibayram/Qwen3-30B-A3B-Instruct-2507:latest"
+    # OLLAMA_GENERIC = "glm-4.7-flash"
 
 
 class OpenRouterModelName(StrEnum):

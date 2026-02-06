@@ -168,6 +168,26 @@ class Settings(BaseSettings):
     QDRANT_PORT: int | None = 6333
     QDRANT_API_KEY: SecretStr | None = None
 
+    # Long-term memory configuration
+    LONG_TERM_MEMORY_ENABLED: bool = True
+    # Options: "pg_plus_qdrant", "postgres_only", "qdrant_only"
+    LONG_TERM_MEMORY_BACKEND: str = "pg_plus_qdrant"
+    LONG_TERM_MEMORY_TOP_K: int = 5
+    LONG_TERM_MEMORY_MAX_ITEM_CHARS: int = 400
+    LONG_TERM_MEMORY_SUMMARY_MAX_CHARS: int = 1500
+    LONG_TERM_MEMORY_MODEL: str | None = None
+    LONG_TERM_MEMORY_STORE_TIMEOUT_MS: int = 500
+    
+    # Memory enhancement configuration (new)
+    LONG_TERM_MEMORY_DEDUP_THRESHOLD: float = 0.95  # Semantic similarity threshold for deduplication
+    LONG_TERM_MEMORY_MAX_CONTEXT_TOKENS: int = 4000  # Max tokens for entire memory context injection
+    LONG_TERM_MEMORY_COMPRESSION_INTERVAL: int = 10  # Compress memories every N turns
+    LONG_TERM_MEMORY_MIN_RELEVANCE_SCORE: float = 0.3  # Filter snippets below this relevance score
+    
+    # Embedding cache configuration
+    EMBEDDING_CACHE_ENABLED: bool = True
+    EMBEDDING_CACHE_PATH: str = "./data/embedding_cache.json"
+
     # Azure OpenAI Settings
     AZURE_OPENAI_API_KEY: SecretStr | None = None
     AZURE_OPENAI_ENDPOINT: str | None = None
@@ -175,6 +195,10 @@ class Settings(BaseSettings):
     AZURE_OPENAI_DEPLOYMENT_MAP: dict[str, str] = Field(
         default_factory=dict, description="Map of model names to Azure deployment IDs"
     )
+
+    # RAG 混合检索配置
+    RAG_HYBRID_SEARCH: bool = True       # 是否启用 BM25 + 向量的混合检索（关闭则仅向量检索）
+    RAG_BM25_WEIGHT: float = 0.4         # BM25 在 RRF 融合中的权重（0.0-1.0，越大越偏关键词匹配）
 
     # 数据清理配置
     CLEANUP_INTERVAL_HOURS: int = 24  # 清理间隔，单位：小时

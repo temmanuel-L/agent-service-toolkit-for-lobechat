@@ -86,16 +86,27 @@ def create_rag_system_prompt(
     Returns:
         完整的系统提示词
     """
-    kb_info = f"知识库: {', '.join(kb_ids)}" if kb_ids else ""
-    
+    if not kb_ids:
+        kb_info = ""
+        tool_instruction = "当前未绑定知识库，无法使用 search_knowledge。若用户询问文档内容，请告知其需要先绑定知识库。"
+    else:
+        kb_info = f"本对话已绑定知识库: {', '.join(kb_ids)}。"
+        # 引导 LLM 先检索再回答，但明确禁止重复调用
+        tool_instruction = """
+**检索流程规则**:
+1. 收到用户问题后，先调用 search_knowledge 工具检索相关信息
+2. 收到检索结果后，直接根据结果回答用户问题，**不要再次调用工具**
+3. 如果检索结果不相关或为空，看看用户提问与长期记忆是否相关。
+4. **禁止**连续多次调用同一工具或使用相似查询重复检索"""
+
     base_prompt = f"""【强制】用{user_language}回答。无论检索内容是什么语言，输出必须是{user_language}。
 
 你是知识库助手。{kb_info}
-用 search_knowledge 工具检索后回答问题。
+{tool_instruction}
 
-规则：
-1. 简洁回答 - 问"作者是谁"就答"作者是XXX"，不要分析全文
-2. 不编造 - 找不到就说找不到
+**回答原则**:
+1. 简洁回答 - 直接回应用户问题，不需要重复检索结果原文
+2. 不编造 - 找不到就说找不到，不要凭空捏造答案
 3. 用{user_language}输出"""
 
     if custom_instructions:
@@ -113,7 +124,7 @@ def filter_frontend_messages(messages: list) -> list:
     过滤前端（如 LobeChat）发送的系统消息
     
     前端可能会注入与我们指令冲突的 SystemMessage，
-    这个函数将其过滤掉，只保留用户和助手的消息。
+    这个函数将其过滤掉，只保留用户和助手的消息。以及长期记忆消息
     
     Args:
         messages: 原始消息列表
@@ -124,6 +135,10 @@ def filter_frontend_messages(messages: list) -> list:
     filtered = []
     for msg in messages:
         if isinstance(msg, SystemMessage):
+            source = getattr(msg, "additional_kwargs", {}) or {}
+            if source.get("source") == "long_term_memory":
+                filtered.append(msg)
+                continue
             continue
         filtered.append(msg)
     return filtered
@@ -179,8 +194,12 @@ def create_rag_model_node(
     async def rag_model_node(state: MessagesState, config: RunnableConfig) -> dict:
         """RAG 模型调用节点"""
         
-        # 1. 从配置中获取知识库 ID
+        # 1. 从配置中获取知识库 ID（由前端 LobeChat 在请求体中传入）
         kb_ids = config["configurable"].get("kb_ids") or []
+        if not kb_ids:
+            logger.info(
+                "RAG 未收到 kb_ids，知识库检索将不可用。请确认对话是否已绑定知识库且前端请求传入了 kb_ids。"
+            )
         
         # 2. 设置模型和工具
         model = get_model(config["configurable"].get("model", settings.DEFAULT_MODEL))

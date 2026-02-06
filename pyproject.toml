@@ -13,7 +13,7 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
 ]
 
-requires-python = ">=3.11,<3.14"
+requires-python = ">=3.12,<3.13"
 
 dependencies = [
     "docx2txt ~=0.8",
@@ -54,6 +54,7 @@ dependencies = [
     "qdrant-client ~=1.15.1",
     "langchain-qdrant ~=1.1.0",
     "setuptools ~=75.6.0",
+    "scikit-learn>=1.6.0",
     "streamlit ~=1.46.0",
     "tiktoken >=0.8.0",
     "uvicorn ~=0.32.1",
@@ -66,6 +67,7 @@ dependencies = [
     "llama-index-readers-file ~= 0.4.0",
     "llama-index-llms-openai ~= 0.3.0",
     "llama-index-embeddings-langchain ~= 0.3.0",
+    "llama-index-retrievers-bm25 ~= 0.5.0",
     "python-multipart ~= 0.0.12"
 ]
 

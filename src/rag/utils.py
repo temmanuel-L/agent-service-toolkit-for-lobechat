@@ -73,55 +73,36 @@ def format_rag_fallback_response(
     max_preview_segments: int = 3
 ) -> str:
     """
-    当模型无法正确处理工具结果时，生成格式化的回退响应
-    
-    这个函数用于处理模型返回空内容的情况，将原始工具结果
-    格式化为用户可读的形式。
-    
-    Args:
-        tool_result: 工具返回的原始结果
-        max_preview_length: 预览内容的最大长度
-        max_preview_segments: 预览的最大段落数
-        
-    Returns:
-        格式化的回退响应内容
+    当模型无法正确处理工具结果时，生成回退响应。
+
+    设计原则：
+    - **绝不**将原始检索 segment 暴露给前端用户
+    - 仅告知用户"检索到了信息但无法生成摘要"
+    - 引导用户重试或换个问法
+
+    之所以不展示原始 segment：
+    1. RAG segment 是内部上下文，包含大量无关噪声（公式、表格碎片等）
+    2. 用户期望的是 LLM 的整合回答，而非检索原文
+    3. 暴露原文会严重影响用户体验
     """
     if not tool_result:
         return (
             "抱歉，我尝试搜索了知识库，但未找到相关内容。"
             "请尝试用不同的方式提问，或确认知识库中包含相关信息。"
         )
-    
-    # 解析段落
+
+    # 统计检索到多少段落（仅用于提示，不暴露内容）
     segments = tool_result.split(RAG_SEGMENT_SEPARATOR)
-    
-    if not segments:
-        return (
-            "抱歉，知识库检索结果无法正确解析。"
-            "请尝试用不同的方式提问。"
-        )
-    
-    # 只展示前几个段落
-    preview_segments = segments[:max_preview_segments]
-    formatted_preview = RAG_SEGMENT_SEPARATOR.join(preview_segments)
-    
-    # 限制总长度
-    if len(formatted_preview) > max_preview_length:
-        formatted_preview = formatted_preview[:max_preview_length] + "...\n\n(内容已截断)"
-    
-    # 构建响应
-    remaining_count = len(segments) - max_preview_segments
-    remaining_note = f"\n\n*还有 {remaining_count} 个相关段落未显示*" if remaining_count > 0 else ""
-    
-    fallback_content = (
-        f"我在知识库中找到了以下相关信息：\n\n"
-        f"{formatted_preview}"
-        f"{remaining_note}\n\n"
-        f"---\n"
-        f"*注：以上为知识库原始检索结果。如需更详细的分析，请提出更具体的问题。*"
+    segment_count = len([s for s in segments if s.strip()])
+
+    return (
+        f"我在知识库中检索到了 {segment_count} 条相关信息，"
+        f"但模型未能成功生成摘要回答。\n\n"
+        f"建议您：\n"
+        f"1. 尝试用更具体的问题重新提问\n"
+        f"2. 缩小问题范围，聚焦某一方面\n"
+        f"3. 如果问题持续，可切换到其他智能体再试"
     )
-    
-    return fallback_content
 
 
 def is_rag_tool_message(tool_name: str) -> bool:

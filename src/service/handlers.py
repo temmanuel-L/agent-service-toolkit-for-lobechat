@@ -18,8 +18,10 @@ Deduplication Strategy (去重策略):
 - 所有去重在message_generator层完成，openai_paradigm层不再去重
 - updates模式发送的完整消息会检查是否已通过messages模式流式发送
 """
+import asyncio
 import inspect
 import json
+import time
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 from typing import Any
@@ -37,6 +39,7 @@ from langsmith.utils import LangSmithAuthError
 
 from agents.agents import DEFAULT_AGENT, AgentGraph, get_agent, get_all_agent_info
 from core import settings
+from memory.long_term import memory_manager
 
 from schema import (
     ChatMessage,
@@ -48,6 +51,7 @@ from schema import (
 )
 from service.utils import convert_message_content_to_string, langchain_to_chat_message, remove_tool_calls
 from .task_manager import _build_stop_chat_message, register_active_task, unregister_active_task
+from memory.utils import is_low_quality_text
 from utils.log_utils import get_logger
 
 logger = get_logger(__name__)
@@ -336,14 +340,46 @@ async def _handle_input(
     interrupted_tasks = [
         task for task in state.tasks if hasattr(task, "interrupts") and task.interrupts
     ]
+    is_interrupted = bool(interrupted_tasks)
+
+    # 预先构建长期记忆系统消息（仅在非中断恢复时注入）
+    memory_message = None
+    if (
+        settings.LONG_TERM_MEMORY_ENABLED
+        and not is_interrupted
+        and user_input.message
+        and user_id
+    ):
+        memory_start = time.perf_counter()
+        try:
+            memory_message = await memory_manager.abuild_system_message(
+                user_id=user_id,
+                query=user_input.message,
+            )
+            logger.info(
+                "长期记忆注入完成: user_id=%s has_memory=%s elapsed_ms=%.2f",
+                user_id,
+                bool(memory_message),
+                (time.perf_counter() - memory_start) * 1000,
+            )
+        except Exception as exc:
+            logger.warning(
+                "构建长期记忆上下文失败: user_id=%s elapsed_ms=%.2f err=%s",
+                user_id,
+                (time.perf_counter() - memory_start) * 1000,
+                exc,
+            )
 
     # 根据是否存在中断任务决定输入数据的格式
-    if interrupted_tasks:
+    if is_interrupted:
         # 假设用户输入是用于从中断处恢复agent执行的响应
         input_data: Command[Any] | dict[str, Any] = Command(resume=user_input.message)
     else:
         # 正常情况下将用户消息包装成HumanMessage
-        input_data = {"messages": [HumanMessage(content=user_input.message)]}
+        messages = [HumanMessage(content=user_input.message)]
+        if memory_message:
+            messages.insert(0, memory_message)
+        input_data = {"messages": messages}
 
     # 构建执行参数
     kwargs = {
@@ -384,6 +420,7 @@ async def invoke_handler(user_input: UserInput, agent_id: str = DEFAULT_AGENT) -
     user_id = configurable.get("user_id")
     thread_id = configurable.get("thread_id")
 
+    should_record_memory = False
     try:
         # 使用 propagate_attributes 追踪用户和会话 (Langfuse 最佳实践)
         with propagate_attributes(user_id=user_id, session_id=thread_id):
@@ -392,6 +429,7 @@ async def invoke_handler(user_input: UserInput, agent_id: str = DEFAULT_AGENT) -
         if response_type == "values":
             # Normal response, the agent completed successfully
             output = langchain_to_chat_message(response["messages"][-1])
+            should_record_memory = True
         elif response_type == "updates" and "__interrupt__" in response:
             # The last thing to occur was an interrupt
             # Return the value of the first interrupt as an AIMessage
@@ -406,6 +444,17 @@ async def invoke_handler(user_input: UserInput, agent_id: str = DEFAULT_AGENT) -
         if cancel_event.is_set():
             logger.info(f"任务 {task_id} 在响应发送前就停止了")
             return _build_stop_chat_message(run_id, "当前对话已被用户停止")
+        if should_record_memory and output and output.content:
+            try:
+                await memory_manager.arecord_turn(
+                    user_id=user_id,
+                    thread_id=thread_id,
+                    user_message=user_input.message,
+                    assistant_message=str(output.content),
+                    config=kwargs.get("config"),
+                )
+            except Exception as exc:
+                logger.warning("写入长期记忆失败: %s", exc)
         return output
     except Exception as e:
         logger.error(f"An exception occurred: {e}")
@@ -477,6 +526,8 @@ async def message_generator(
     # 这是解决 updates/messages 双通道重复发送问题的核心
     stream_state = StreamState()
 
+    final_ai_content: str | None = None
+    has_interrupt = False
     try:
         # 从图中处理流式事件。使用 propagate_attributes 追踪用户和会话 (Langfuse 最佳实践)
         with propagate_attributes(user_id=user_id, session_id=thread_id):
@@ -564,6 +615,7 @@ async def message_generator(
                         # 在更复杂的实现中，我们可以添加一些结构化的 ChatMessage 类型来返回中断值
                         # 中断内容通常为非流式静态文本，需要作为完整消息发送
                         if node == "__interrupt__":
+                            has_interrupt = True
                             for interrupt in updates:
                                 val = interrupt.value if hasattr(interrupt, 'value') else str(interrupt)
                                 messages_to_send.append(AIMessage(content=val))
@@ -643,6 +695,7 @@ async def message_generator(
                                 stream_state.mark_message_sent(content)
                                 if content.strip():  # 有实际内容时标记
                                     stream_state.mark_content_sent()
+                                    final_ai_content = content
                         
                         yield f"data: {json.dumps({'type': 'message', 'content': chat_message.model_dump()})}\n\n"
                     continue
@@ -677,6 +730,27 @@ async def message_generator(
                 yield f"data: {json.dumps({'type': 'message', 'content': fallback_message})}\n\n"
         
         unregister_active_task(task_id)
+        # ===== 长期记忆回写 =====
+        if settings.LONG_TERM_MEMORY_ENABLED and not has_interrupt:
+            assistant_content = final_ai_content or stream_state.streamed_content.strip()
+            if user_id and assistant_content:
+                async def _record_memory():
+                    await memory_manager.arecord_turn(
+                        user_id=user_id,
+                        thread_id=thread_id,
+                        user_message=user_input.message,
+                        assistant_message=assistant_content,
+                        config=kwargs.get("config"),
+                    )
+
+                def _log_memory_error(task: asyncio.Task) -> None:
+                    try:
+                        task.result()
+                    except Exception as exc:
+                        logger.warning("异步写入长期记忆失败: %s", exc)
+
+                task = asyncio.create_task(_record_memory())
+                task.add_done_callback(_log_memory_error)
         yield "data: [DONE]\n\n"
 
 
@@ -876,3 +950,36 @@ async def feedback_handler(feedback: Feedback) -> FeedbackResponse:
     )
     langfuse.flush()  # 确保同步发送（可选，但 feedback 建议 flush）
     return FeedbackResponse()
+
+
+def sanitize_chat_history(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    清洗聊天历史（短期记忆），去除低质量内容。
+    
+    用于防止前端传递的对话历史中包含已污染的死循环文本（如 "A. A. A..."），
+    导致 LLM 再次陷入循环。这是 RAG 系统稳定性的重要防线（安检门）。
+    
+    Args:
+        messages: 原始消息列表 [{"role": "...", "content": "..."}]
+        
+    Returns:
+        list: 清清洗后的消息列表
+    """
+    if not messages:
+        return []
+        
+    valid_messages = []
+    original_count = len(messages)
+    
+    for i, msg in enumerate(messages):
+        content = msg.get("content", "")
+        # 只检查 AI 回复或较长的内容，跳过简短的用户指令
+        if isinstance(content, str) and len(content) > 50 and is_low_quality_text(content):
+            logger.warning(f"检测到输入历史中包含脏数据 (索引 {i}, 已剔除): {content[:50]}...")
+            continue
+        valid_messages.append(msg)
+        
+    if len(valid_messages) < original_count:
+        logger.warning(f"短期记忆净化完成: {original_count} -> {len(valid_messages)} 条")
+        
+    return valid_messages
