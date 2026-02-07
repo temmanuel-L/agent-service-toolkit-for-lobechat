@@ -46,6 +46,8 @@ logger = get_logger(__name__)
 # Postgres store 中的 namespace / key 约定
 SUMMARY_NAMESPACE_SUFFIX = "long_term_summary"
 SUMMARY_KEY = "summary"
+PENDING_NAMESPACE_SUFFIX = "long_term_pending"
+PENDING_KEY = "inputs"
 
 
 # ===== 工具函数 ============================================================
@@ -279,6 +281,38 @@ class MemoryManager:
                 user_id, (time.perf_counter() - start) * 1000, exc,
             )
 
+    async def _aget_pending(self, user_id: str) -> list[str]:
+        """读取待压缩的摘要输入缓冲（用于按间隔压缩）。"""
+        store = self._store
+        if not store or not user_id or not _backend_uses_summary():
+            return []
+        try:
+            item = await asyncio.wait_for(
+                store.aget((user_id, PENDING_NAMESPACE_SUFFIX), key=PENDING_KEY),
+                timeout=settings.LONG_TERM_MEMORY_STORE_TIMEOUT_MS / 1000,
+            )
+            item = _normalize_store_item(item)
+            if not item:
+                return []
+            value = getattr(item, "value", None) or {}
+            messages = value.get("messages")
+            return list(messages) if isinstance(messages, list) else []
+        except Exception:
+            return []
+
+    async def _aput_pending(self, user_id: str, messages: list[str]) -> None:
+        """写入待压缩的摘要输入缓冲。"""
+        store = self._store
+        if not store or not user_id or not _backend_uses_summary():
+            return
+        try:
+            await asyncio.wait_for(
+                store.aput((user_id, PENDING_NAMESPACE_SUFFIX), PENDING_KEY, {"messages": messages}),
+                timeout=settings.LONG_TERM_MEMORY_STORE_TIMEOUT_MS / 1000,
+            )
+        except Exception as exc:
+            logger.warning("待压缩缓冲写入失败: user=%s err=%s", user_id, exc)
+
     async def _aupdate_summary(
         self, user_id: str, messages: Iterable[str], config: RunnableConfig | None = None,
     ) -> str | None:
@@ -297,6 +331,9 @@ class MemoryManager:
         if not merged:
             return await self._aget_summary(user_id)
 
+        # 限制单条长度，缩短摘要 LLM 输入以加快推理
+        max_chars = getattr(settings, "LONG_TERM_MEMORY_MAX_ITEM_CHARS", 400)
+        merged = [_truncate(m, max_chars) for m in merged]
         previous = await self._aget_summary(user_id) or "无"
         input_text = "\n".join(f"- {m}" for m in merged)
 
@@ -363,9 +400,8 @@ class MemoryManager:
             return unique_snippets
         
         try:
-            # Get embeddings for all snippets
-            from core.llm import get_embedding_model
-            embed_model = get_embedding_model()
+            from memory.embedding_cache import get_cache_aware_embedding
+            embed_model = get_cache_aware_embedding()
             embeddings = await embed_model.aembed_documents(unique_snippets)
             
             # Compute pairwise cosine similarity
@@ -397,61 +433,36 @@ class MemoryManager:
             logger.warning(f"语义去重失败: {exc}，使用哈希去重结果")
             return unique_snippets
     
-    async def _score_relevance(self, snippet: str, query: str) -> float:
-        """
-        计算记忆片段与当前查询的相关性分数（0.0-1.0）。
-        
-        使用embedding模型计算余弦相似度。
-        """
-        try:
-            from core.llm import get_embedding_model
-            embed_model = get_embedding_model()
-            
-            snippet_emb, query_emb = await asyncio.gather(
-                embed_model.aembed_query(snippet),
-                embed_model.aembed_query(query),
-            )
-            
-            # Compute cosine similarity
-            snippet_vec = np.array(snippet_emb).reshape(1, -1)
-            query_vec = np.array(query_emb).reshape(1, -1)
-            score = float(cosine_similarity(snippet_vec, query_vec)[0][0])
-            
-            return max(0.0, min(1.0, score))  # Clamp to [0, 1]
-        
-        except Exception as exc:
-            logger.warning(f"相关性评分失败: {exc}")
-            return 0.5  # Default to neutral score on error
-    
     async def _filter_by_relevance(self, snippets: list[str], query: str) -> list[str]:
         """
-        过滤低相关性的记忆片段。
-        
-        只保留相关性分数 >= MIN_RELEVANCE_SCORE 的片段。
+        过滤低相关性的记忆片段。批量 embedding（1 次 query + 1 次 documents），避免 N×2 次 API 调用。
         """
         if not snippets:
             return []
-        
         threshold = settings.LONG_TERM_MEMORY_MIN_RELEVANCE_SCORE
-        
-        # Score all snippets concurrently
-        scores = await asyncio.gather(*[
-            self._score_relevance(s, query) for s in snippets
-        ])
-        
-        # Filter and sort by score (descending)
-        scored_snippets = [(s, score) for s, score in zip(snippets, scores) if score >= threshold]
-        scored_snippets.sort(key=lambda x: x[1], reverse=True)
-        
-        filtered = [s for s, score in scored_snippets]
-        
-        if len(filtered) < len(snippets):
-            logger.info(
-                f"相关性过滤: {len(snippets)} -> {len(filtered)} "
-                f"(threshold={threshold:.2f}, scores={[f'{sc:.2f}' for _, sc in scored_snippets[:3]]})"
+        try:
+            from memory.embedding_cache import get_cache_aware_embedding
+            embed_model = get_cache_aware_embedding()
+            query_emb, snippet_embs = await asyncio.gather(
+                embed_model.aembed_query(query),
+                embed_model.aembed_documents(snippets),
             )
-        
-        return filtered
+            q = np.array(query_emb).reshape(1, -1)
+            S = np.array(snippet_embs)
+            scores = cosine_similarity(S, q).ravel()
+            scored_snippets = [(s, float(max(0.0, min(1.0, sc)))) for s, sc in zip(snippets, scores) if sc >= threshold]
+            scored_snippets.sort(key=lambda x: x[1], reverse=True)
+            filtered = [s for s, _ in scored_snippets]
+            if len(filtered) < len(snippets):
+                logger.info(
+                    "相关性过滤: %d -> %d (threshold=%.2f, scores=%s)",
+                    len(snippets), len(filtered), threshold,
+                    [f"{sc:.2f}" for _, sc in scored_snippets[:3]],
+                )
+            return filtered
+        except Exception as exc:
+            logger.warning("相关性过滤失败: %s，保留全部片段", exc)
+            return snippets
     
     async def _aretrieve_snippets(self, query: str, user_id: str, top_k: int | None = None) -> list[str]:
         """
@@ -468,34 +479,98 @@ class MemoryManager:
             return []
 
         k = top_k or settings.LONG_TERM_MEMORY_TOP_K
-        # Retrieve more candidates for filtering
-        retrieve_k = k * 3  # Retrieve 3x to account for dedup and filtering
-        
-        start = time.perf_counter()
-        try:
-            docs = await self._vector_manager.asimilarity_search(query=query, user_id=user_id, k=retrieve_k)
-        except Exception as exc:
-            logger.warning("向量检索失败: user=%s elapsed=%.1fms err=%s", user_id, (time.perf_counter() - start) * 1000, exc)
-            return []
+        retrieve_k = min(k * 2, 20)  # 记忆不多时减少检索量，目标构建 <1s
 
-        # Extract and validate content
+        from memory.embedding_cache import get_cache_aware_embedding
+        embed_model = get_cache_aware_embedding()
+
+        # 先算 query embedding 一次，再按向量检索，避免 asimilarity_search 内部再算一次（省 1 次 API）
+        t0 = time.perf_counter()
+        try:
+            query_emb = await embed_model.aembed_query(query)
+        except Exception as exc:
+            logger.warning("长期记忆 query embedding 失败: %s", exc)
+            return []
+        t_query_embed = (time.perf_counter() - t0) * 1000
+
+        try:
+            docs = await self._vector_manager.asimilarity_search_by_vector(
+                query_vector=query_emb,
+                user_id=user_id,
+                k=retrieve_k,
+            )
+        except Exception as exc:
+            logger.warning("向量检索失败: user=%s elapsed=%.1fms err=%s", user_id, (time.perf_counter() - t0) * 1000, exc)
+            return []
+        t_qdrant = (time.perf_counter() - t0) * 1000 - t_query_embed
+
         snippets = []
         for doc in docs:
             content = getattr(doc, "page_content", "") or ""
             if _validate_content(content):
                 snippets.append(_truncate(content, settings.LONG_TERM_MEMORY_MAX_ITEM_CHARS))
-        
-        logger.info("向量检索: user=%s raw_hits=%d valid=%d elapsed=%.1fms", 
-                    user_id, len(docs), len(snippets), (time.perf_counter() - start) * 1000)
-        
-        # Deduplication
-        snippets = await self._deduplicate_snippets(snippets)
-        
-        # Relevance filtering
-        snippets = await self._filter_by_relevance(snippets, query)
-        
-        # Return top-k after filtering
-        return snippets[:k]
+
+        if not snippets:
+            logger.info(
+                "长期记忆耗时: query_embed=%.0fms qdrant=%.0fms snippets=0 total=%.0fms",
+                t_query_embed, t_qdrant, (time.perf_counter() - t0) * 1000,
+            )
+            return []
+
+        # 哈希去重（无 API）
+        seen_hashes = set()
+        unique_snippets = []
+        for s in snippets:
+            h = _hash_text(s)
+            if h not in seen_hashes:
+                seen_hashes.add(h)
+                unique_snippets.append(s)
+        if len(unique_snippets) < len(snippets):
+            logger.info("哈希去重: %d -> %d", len(snippets), len(unique_snippets))
+        snippets = unique_snippets
+
+        # 只对 snippets 做一次 embedding，query_emb 已在上方算过并用于检索
+        t_embed_start = time.perf_counter()
+        try:
+            snippet_embs = await embed_model.aembed_documents(snippets)
+        except Exception as exc:
+            logger.warning("长期记忆 snippet embedding 失败: %s，返回哈希去重结果", exc)
+            logger.info(
+                "长期记忆耗时: query_embed=%.0fms qdrant=%.0fms snippet_embed_fail total=%.0fms",
+                t_query_embed, t_qdrant, (time.perf_counter() - t0) * 1000,
+            )
+            return snippets[:k]
+        t_snippet_embed = (time.perf_counter() - t_embed_start) * 1000
+
+        S = np.array(snippet_embs)
+        # 语义去重：相似度矩阵，保留首个
+        if len(snippets) > 1:
+            sim = cosine_similarity(S)
+            to_keep = [True] * len(snippets)
+            dedup_th = settings.LONG_TERM_MEMORY_DEDUP_THRESHOLD
+            for i in range(len(snippets)):
+                if not to_keep[i]:
+                    continue
+                for j in range(i + 1, len(snippets)):
+                    if to_keep[j] and sim[i, j] > dedup_th:
+                        to_keep[j] = False
+            snippets = [s for i, s in enumerate(snippets) if to_keep[i]]
+            S = S[to_keep]
+
+        # 相关性过滤并排序
+        q = np.array(query_emb).reshape(1, -1)
+        scores = cosine_similarity(S, q).ravel()
+        rel_th = settings.LONG_TERM_MEMORY_MIN_RELEVANCE_SCORE
+        scored = [(s, float(max(0.0, min(1.0, sc)))) for s, sc in zip(snippets, scores) if sc >= rel_th]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        result = [s for s, _ in scored][:k]
+        t_dedup_filter = (time.perf_counter() - t_embed_start) * 1000 - t_snippet_embed
+        total_ms = (time.perf_counter() - t0) * 1000
+        logger.info(
+            "长期记忆耗时: query_embed=%.0fms qdrant=%.0fms snippet_embed=%.0fms dedup_filter=%.0fms total=%.0fms raw=%d -> %d",
+            t_query_embed, t_qdrant, t_snippet_embed, max(0, t_dedup_filter), total_ms, len(docs), len(result),
+        )
+        return result
 
     # ---- 公共 API ----
 
@@ -509,10 +584,47 @@ class MemoryManager:
         """
         start = time.perf_counter()
         max_tokens = settings.LONG_TERM_MEMORY_MAX_CONTEXT_TOKENS
-        
-        summary = await self._aget_summary(user_id) if _backend_uses_summary() else None
-        snippets = await self._aretrieve_snippets(query, user_id) if _backend_uses_vector() else []
-        
+
+        use_summary = _backend_uses_summary()
+        use_vector = _backend_uses_vector()
+        max_wait_ms = getattr(settings, "LONG_TERM_MEMORY_MAX_WAIT_MS", 0)
+
+        if use_summary and use_vector:
+            summary = await self._aget_summary(user_id)
+            if max_wait_ms > 0:
+                try:
+                    snippets = await asyncio.wait_for(
+                        self._aretrieve_snippets(query, user_id),
+                        timeout=max_wait_ms / 1000.0,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "长期记忆片段检索超时(limit=%dms)，仅使用摘要以保证响应速度",
+                        max_wait_ms,
+                    )
+                    snippets = []
+            else:
+                snippets = await self._aretrieve_snippets(query, user_id)
+        elif use_summary:
+            summary = await self._aget_summary(user_id)
+            snippets = []
+        elif use_vector:
+            summary = None
+            if max_wait_ms > 0:
+                try:
+                    snippets = await asyncio.wait_for(
+                        self._aretrieve_snippets(query, user_id),
+                        timeout=max_wait_ms / 1000.0,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning("长期记忆片段检索超时(limit=%dms)，返回空片段", max_wait_ms)
+                    snippets = []
+            else:
+                snippets = await self._aretrieve_snippets(query, user_id)
+        else:
+            summary = None
+            snippets = []
+
         # Estimate tokens and enforce limit
         summary_tokens = _estimate_tokens(summary) if summary else 0
         remaining_tokens = max_tokens - summary_tokens
@@ -614,11 +726,22 @@ class MemoryManager:
             except Exception as exc:
                 logger.warning("向量写入失败: user=%s err=%s", user_id, exc)
 
-        # 写入 Postgres 摘要
+        # 写入 Postgres 摘要（按间隔压缩：仅每 N 轮调用 LLM，其余轮只缓冲，缩短回写时间）
         summary_ok = False
         if self._store and summary_inputs and _backend_uses_summary():
-            await self._aupdate_summary(user_id, summary_inputs, config=config)
-            summary_ok = True
+            interval = settings.LONG_TERM_MEMORY_COMPRESSION_INTERVAL or 1
+            if interval <= 1:
+                await self._aupdate_summary(user_id, summary_inputs, config=config)
+                summary_ok = True
+            else:
+                pending = await self._aget_pending(user_id)
+                pending.extend(summary_inputs)
+                if len(pending) >= interval:
+                    await self._aupdate_summary(user_id, pending, config=config)
+                    await self._aput_pending(user_id, [])
+                    summary_ok = True
+                else:
+                    await self._aput_pending(user_id, pending)
 
         logger.info(
             "记忆回写: user=%s vector=%s summary=%s elapsed=%.1fms",

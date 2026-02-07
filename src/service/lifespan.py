@@ -146,9 +146,10 @@ async def lifespan(app) -> AsyncGenerator[None, None]:
     启动时初始化所有基础设施（Qdrant / Postgres / Agent / 长期记忆），
     关闭时由 AsyncExitStack 自动释放全部资源。
     """
+    cleanup_task = None  # 避免异常时 finally 中 UnboundLocalError
     async with AsyncExitStack() as stack:
         try:
-            # 1. Embedding 模型 & 向量维度
+            # 1. Embedding 模型 & 向量维度（get_embedding_model 内已用 is_ollama_reachable 等做可达性判断）
             global_embeddings = get_embedding_model()
             vector_size = len(global_embeddings.embed_query("hello"))
 
@@ -216,5 +217,6 @@ async def lifespan(app) -> AsyncGenerator[None, None]:
             logger.error("应用初始化失败：%s", exc)
             raise
         finally:
-            cleanup_task.cancel()
+            if cleanup_task is not None:
+                cleanup_task.cancel()
             cleanup_manager.saver = None

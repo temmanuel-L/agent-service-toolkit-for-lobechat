@@ -8,9 +8,10 @@
 已重构为基于 LLM 的信息抽取，配合工具调用与智能路由。
 """
 
+import json
 import uuid
 from datetime import datetime
-from typing import List, Literal, Optional
+from typing import Any, List, Literal, Optional
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -125,6 +126,27 @@ EXTRACTION_SYSTEM_PROMPT = """你是一个信息提取助手。你的任务是�
 4. 必须调用 TravelInfoExtraction 工具返回结果。"""
 
 
+def _normalize_extraction_args(args: dict[str, Any]) -> dict[str, Any]:
+    """将 LLM 返回的 tool call args 归一化：智谱等可能返回 'null' 或 '["x"]' 等字符串。"""
+    out = {}
+    for key, value in args.items():
+        if value is None or value == "null" or value == "":
+            out[key] = None
+            continue
+        if key == "interests" and isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+                out[key] = list(parsed) if isinstance(parsed, list) else None
+            except (json.JSONDecodeError, TypeError):
+                out[key] = None
+            continue
+        if key == "destination" and isinstance(value, str) and value.strip() == "":
+            out[key] = None
+            continue
+        out[key] = value
+    return out
+
+
 # =============================================================================
 # 节点：使用 LLM + 工具调用抽取信息
 # =============================================================================
@@ -171,8 +193,10 @@ async def extract_info(state: PlannerState, config: RunnableConfig) -> dict:
         # 解析工具调用以得到抽取结果
         if response.tool_calls:
             tool_call = response.tool_calls[0]
-            args = tool_call["args"]
-            
+            args = dict(tool_call.get("args") or {})
+            # 智谱等模型有时将 tool call args 中的 null/数组以 JSON 字符串形式返回，需归一化为 Python 类型
+            args = _normalize_extraction_args(args)
+
             # Auto-correction: If destination is a list, move it to interests
             if isinstance(args.get("destination"), list):
                 logger.warning(f"LLM 将列表填入了 destination 字段，自动修正: {args['destination']}")

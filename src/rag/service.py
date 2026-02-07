@@ -228,17 +228,15 @@ class RagService:
         # ---- Embedding 模型 ----
         # 将 LangChain 嵌入模型封装为 LlamaIndex 格式
         lc_embeddings = get_embedding_model()
-        
-        # 使用自适应批处理 Wrapper
-        # 作用：自动计算 token 数量，防止批量 embedding 时超过模型上下文限制（如 8192）
-        from rag.embedding_batcher import TokenAwareEmbedding
-        self.token_aware_embed = TokenAwareEmbedding(
-            lc_embeddings, 
-            max_batch_tokens=6000 # 保守阈值，适配大多数模型（如 Nomic/OpenAI）
+        # 1) Token 批处理：防止批量 embedding 超过模型上下文限制（如 8192）
+        from rag.embedding_batcher import TokenAwareEmbedding, CacheAwareEmbedding
+        token_aware = TokenAwareEmbedding(
+            lc_embeddings,
+            max_batch_tokens=6000,
         )
-        
-        # embed_batch_size设为 100，因为实际批处理由 TokenAwareEmbedding 控制
-        # 这里只是为了让 LlamaIndex 传递一批文档给我们，具体如何拆分由 TokenAwareEmbedding 决定
+        # 2) 复用 memory 的 EmbeddingCache，与长期记忆共用同一缓存，减少重复 API 调用
+        self.token_aware_embed = CacheAwareEmbedding(token_aware)
+        # embed_batch_size 仅控制 LlamaIndex 每批传入条数，实际拆分由 TokenAwareEmbedding 控制
         self.embed_model = LangchainEmbedding(self.token_aware_embed, embed_batch_size=100)
 
         # ---- BM25 缓存 ----

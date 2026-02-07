@@ -14,6 +14,7 @@ class Provider(StrEnum):
     AWS = auto()
     OLLAMA = auto()
     OPENROUTER = auto()
+    ZHIPU = auto()
     FAKE = auto()
 
 
@@ -102,6 +103,18 @@ class OpenAICompatibleName(StrEnum):
     GPT_4O_MINI = "gpt-4o-mini"
 
 
+class ZhipuModelName(StrEnum):
+    """智谱 GLM 系列，https://docs.bigmodel.cn/cn/guide/start/model-overview
+    对话补全: https://open.bigmodel.cn/api/paas/v4/chat/completions
+    """
+
+    GLM_4_7 = "glm-4.7"  # 高智能旗舰，通用对话/推理/智能体
+    GLM_4_6 = "glm-4.6"  # 超强性能，200K 上下文
+    GLM_4_7_FLASH = "glm-4.7-flash"  # 免费普惠，速度与效果平衡
+    GLM_4_7_FLASHX = "glm-4.7-flashx"  # 轻量高速，中文写作/翻译/长文本
+    GLM_4_5_AIR = "glm-4.5-air"  # 高性价比，推理/编码/智能体
+
+
 class FakeModelName(StrEnum):
     """Fake model for testing."""
 
@@ -120,5 +133,6 @@ AllModelEnum: TypeAlias = (
     | AWSModelName
     | OllamaModelName
     | OpenRouterModelName
+    | ZhipuModelName
     | FakeModelName
 )

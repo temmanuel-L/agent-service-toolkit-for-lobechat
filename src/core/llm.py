@@ -8,10 +8,10 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_google_vertexai import ChatVertexAI
 from langchain_groq import ChatGroq
 from langchain_ollama import ChatOllama, OllamaEmbeddings
-from langchain_openai import AzureChatOpenAI, ChatOpenAI
+from langchain_openai import AzureChatOpenAI, ChatOpenAI, OpenAIEmbeddings
 
 from utils.log_utils import get_logger
-from core.settings import settings
+from core.settings import settings, is_ollama_reachable
 from schema.models import (
     AllModelEnum,
     AnthropicModelName,
@@ -26,6 +26,7 @@ from schema.models import (
     OpenAIModelName,
     OpenRouterModelName,
     VertexAIModelName,
+    ZhipuModelName,
 )
 
 logger = get_logger(__name__)
@@ -42,6 +43,7 @@ _MODEL_TABLE = (
     | {m: m.value for m in AWSModelName}
     | {m: m.value for m in OllamaModelName}
     | {m: m.value for m in OpenRouterModelName}
+    | {m: m.value for m in ZhipuModelName}
     | {m: m.value for m in FakeModelName}
 )
 
@@ -49,6 +51,7 @@ _MODEL_TABLE = (
 _EMBEDDING_MODEL_TABLE = {
     "openai": "text-embedding-3-small",
     "ollama": "nomic-embed-text:latest",
+    "zhipu": "embedding-2",
 }
 
 
@@ -162,6 +165,17 @@ def get_model(model_name: AllModelEnum, /) -> ModelT:
             base_url="https://openrouter.ai/api/v1/",
             api_key=settings.OPENROUTER_API_KEY,
         )
+    if model_name in ZhipuModelName:
+        if not settings.ZHIPU_API_KEY:
+            raise ValueError("Zhipu provider is active but ZHIPU_API_KEY is not set.")
+        # 必须用同步对话补全: .../v4/chat/completions（支持流式）。异步接口 .../v4/async/chat/completions 只返回 task_id，需轮询取结果，与 ChatOpenAI 不兼容，会报 No generations found in stream
+        return ChatOpenAI(
+            model=api_model_name,
+            temperature=0.5,
+            streaming=True,
+            base_url="https://open.bigmodel.cn/api/paas/v4",
+            api_key=settings.ZHIPU_API_KEY.get_secret_value(),
+        )
     if model_name in FakeModelName:
         return FakeToolModel(responses=["This is a test response from the fake model."])
 
@@ -170,62 +184,61 @@ def get_model(model_name: AllModelEnum, /) -> ModelT:
 
 @cache
 def get_embedding_model(embedding_provider: str = "ollama") -> Any:
-    """获取embedding模型，按优先级尝试连接可用的服务
-    
-    优先级顺序：
-    1. Ollama embedding (最高优先级，但需要在公司网络内)
-    2. OpenAI 代理服务 (当Ollama不可用时)
-    3. 标准OpenAI API (最后备选方案)
+    """获取 embedding 模型，按优先级返回已缓存的实例。
+
+    优先级：Ollama > 智谱 (Zhipu) > OpenAI 代理 (DMX) > 标准 OpenAI API。
+    使用 @cache 进程级缓存，同一进程内多次调用返回同一实例，不重复建连。
+
+    注意：不再在首次调用时执行 embed_query("test") 做连接测试，避免冷启动阻塞
+    （约 100–300ms）。连接在首次实际 embedding 时验证；若需启动时预热，请在
+    lifespan 中显式调用一次 embed_query 并 await。
     """
-        # 按优先级尝试获取embedding模型
-    # 1. 首先尝试Ollama embedding（优先级最高）
+    # 1. Ollama embedding（最高优先级）：先做可达性检查，与 settings 中 Provider 判断一致
     if settings.OLLAMA_EMBEDDING_MODEL and settings.OLLAMA_BASE_URL:
+        if is_ollama_reachable(settings.OLLAMA_BASE_URL):
+            try:
+                return OllamaEmbeddings(
+                    model=_EMBEDDING_MODEL_TABLE["ollama"],
+                    base_url=settings.OLLAMA_BASE_URL,
+                )
+            except Exception as e:
+                logger.error("ollama 的 embedding 不可用: %s", e)
+        else:
+            logger.debug("Ollama 不可达 (%s)，跳过 embedding 优先使用", settings.OLLAMA_BASE_URL)
+
+    # 2. 智谱 Embedding（Ollama 不可达时可选用，国内提速）
+    # 官方文档: POST https://open.bigmodel.cn/api/paas/v4/embeddings
+    if settings.ZHIPU_API_KEY:
         try:
-            from langchain_ollama import OllamaEmbeddings
-            # 尝试创建并返回Ollama embedding实例
-            ollama_embeddings = OllamaEmbeddings(
-                model=_EMBEDDING_MODEL_TABLE["ollama"],
-                base_url=settings.OLLAMA_BASE_URL,
+            return OpenAIEmbeddings(
+                model=_EMBEDDING_MODEL_TABLE["zhipu"],
+                base_url="https://open.bigmodel.cn/api/paas/v4",
+                api_key=settings.ZHIPU_API_KEY.get_secret_value(),
             )
-            # 尝试进行一次简单的测试调用以确认连接可用
-            ollama_embeddings.embed_query("test")
-            return ollama_embeddings
         except Exception as e:
-            # 如果Ollama不可用，则忽略错误并继续尝试下一个选项
-            logger.error(f'ollama的embedding不可用, {e}')
-            pass
-    
-    # 2. 尝试OpenAI代理服务 (DMX)
+            logger.debug("智谱 embedding 不可用，跳过: %s", e)
+
+    # 3. OpenAI 代理服务 (DMX)
     if (settings.DMX_CHAT_URL or settings.COMPATIBLE_BASE_URL) and settings.OPENAI_API_KEY:
         try:
-            from langchain_openai import OpenAIEmbeddings
-            openai_embeddings = OpenAIEmbeddings(
+            return OpenAIEmbeddings(
                 model=_EMBEDDING_MODEL_TABLE["openai"],
                 base_url=settings.COMPATIBLE_BASE_URL or settings.DMX_CHAT_URL,
-                api_key=settings.OPENAI_API_KEY.get_secret_value()
+                api_key=settings.OPENAI_API_KEY.get_secret_value(),
             )
-            # 尝试进行一次简单的测试调用以确认连接可用
-            openai_embeddings.embed_query("test")
-            return openai_embeddings
         except Exception as e:
-            # 如果OpenAI代理服务不可用，则忽略错误并继续尝试下一个选项
-            logger.error(f'openai代理服务的embedding不可用, {e}')
+            logger.error(f"openai 代理服务的 embedding 不可用: {e}")
             pass
-    
-    # 3. 最后尝试标准OpenAI API
+
+    # 4. 标准 OpenAI API
     if settings.OPENAI_API_KEY:
         try:
-            from langchain_openai import OpenAIEmbeddings
-            openai_embeddings = OpenAIEmbeddings(
+            return OpenAIEmbeddings(
                 model=_EMBEDDING_MODEL_TABLE["openai"],
                 api_key=settings.OPENAI_API_KEY.get_secret_value(),
             )
-            # 尝试进行一次简单的测试调用以确认连接可用
-            openai_embeddings.embed_query("test")
-            return openai_embeddings
         except Exception as e:
-            # 所有服务都不可用
-            logger.error(f'openai服务的embedding不可用, {e}')
+            logger.error(f"openai 服务的 embedding 不可用: {e}")
             pass
-    
-    raise ValueError("所有embedding服务都不可用：Ollama、DMX代理服务和OpenAI API")
+
+    raise ValueError("所有 embedding 服务都不可用：Ollama、智谱、DMX 代理服务和 OpenAI API")

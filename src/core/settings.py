@@ -28,6 +28,7 @@ from schema.models import (
     OpenRouterModelName,
     Provider,
     VertexAIModelName,
+    ZhipuModelName,
 )
 
 
@@ -106,6 +107,7 @@ class Settings(BaseSettings):
     OLLAMA_BASE_URL: str | None = None
     USE_FAKE_MODEL: bool = False
     OPENROUTER_API_KEY: str | None = None
+    ZHIPU_API_KEY: SecretStr | None = None
 
     # If DEFAULT_MODEL is None, it will be set in model_post_init
     DEFAULT_MODEL: AllModelEnum | None = None  # type: ignore[assignment]
@@ -183,7 +185,9 @@ class Settings(BaseSettings):
     LONG_TERM_MEMORY_MAX_CONTEXT_TOKENS: int = 4000  # Max tokens for entire memory context injection
     LONG_TERM_MEMORY_COMPRESSION_INTERVAL: int = 10  # Compress memories every N turns
     LONG_TERM_MEMORY_MIN_RELEVANCE_SCORE: float = 0.3  # Filter snippets below this relevance score
-    
+    # 长期记忆片段检索最大等待时间(ms)。>0 时超时则仅用摘要，保证首包不因代理慢而拖死；0 表示不限制
+    LONG_TERM_MEMORY_MAX_WAIT_MS: int = 1000
+
     # Embedding cache configuration
     EMBEDDING_CACHE_ENABLED: bool = True
     EMBEDDING_CACHE_PATH: str = "./data/embedding_cache.json"
@@ -207,6 +211,7 @@ class Settings(BaseSettings):
     def model_post_init(self, __context: Any) -> None:
         api_keys = {
             Provider.OLLAMA: self.OLLAMA_MODEL and is_ollama_reachable(self.OLLAMA_BASE_URL),
+            Provider.ZHIPU: self.ZHIPU_API_KEY,
             Provider.OPENAI_COMPATIBLE: (self.COMPATIBLE_BASE_URL and self.COMPATIBLE_MODEL) or self.DMX_CHAT_URL,
             Provider.OPENAI: self.OPENAI_API_KEY,
             Provider.DEEPSEEK: self.DEEPSEEK_API_KEY,
@@ -229,6 +234,10 @@ class Settings(BaseSettings):
                     if self.DEFAULT_MODEL is None:
                         self.DEFAULT_MODEL = OllamaModelName.OLLAMA_GENERIC
                     self.AVAILABLE_MODELS.update(set(OllamaModelName))
+                case Provider.ZHIPU:
+                    if self.DEFAULT_MODEL is None:
+                        self.DEFAULT_MODEL = ZhipuModelName.GLM_4_6
+                    self.AVAILABLE_MODELS.update(set(ZhipuModelName))
                 case Provider.OPENAI_COMPATIBLE:
                     if self.DEFAULT_MODEL is None:
                         self.DEFAULT_MODEL = OpenAICompatibleName.GPT_4O_MINI
