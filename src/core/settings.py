@@ -27,6 +27,7 @@ from schema.models import (
     OpenAIModelName,
     OpenRouterModelName,
     Provider,
+    RerankModelName,
     VertexAIModelName,
     ZhipuModelName,
 )
@@ -109,6 +110,14 @@ class Settings(BaseSettings):
     OPENROUTER_API_KEY: str | None = None
     ZHIPU_API_KEY: SecretStr | None = None
 
+    # Azure OpenAI Settings
+    AZURE_OPENAI_API_KEY: SecretStr | None = None
+    AZURE_OPENAI_ENDPOINT: str | None = None
+    AZURE_OPENAI_API_VERSION: str = "2024-02-15-preview"
+    AZURE_OPENAI_DEPLOYMENT_MAP: dict[str, str] = Field(
+        default_factory=dict, description="Map of model names to Azure deployment IDs"
+    )
+
     # If DEFAULT_MODEL is None, it will be set in model_post_init
     DEFAULT_MODEL: AllModelEnum | None = None  # type: ignore[assignment]
     AVAILABLE_MODELS: set[AllModelEnum] = set()  # type: ignore[assignment]
@@ -128,18 +137,6 @@ class Settings(BaseSettings):
     # MCP Configuration
     GITHUB_PAT: SecretStr | None = None
     MCP_GITHUB_SERVER_URL: str = "https://api.githubcopilot.com/mcp/"
-
-    LANGCHAIN_TRACING_V2: bool = False
-    LANGCHAIN_PROJECT: str = "default"
-    LANGCHAIN_ENDPOINT: Annotated[str, BeforeValidator(check_str_is_http)] = (
-        "https://api.smith.langchain.com"
-    )
-    LANGCHAIN_API_KEY: SecretStr | None = None
-
-    LANGFUSE_TRACING: bool = False
-    LANGFUSE_HOST: Annotated[str, BeforeValidator(check_str_is_http)] = "https://cloud.langfuse.com"
-    LANGFUSE_PUBLIC_KEY: SecretStr | None = None
-    LANGFUSE_SECRET_KEY: SecretStr | None = None
 
     # Database Configuration
     DATABASE_TYPE: DatabaseType = (
@@ -170,6 +167,20 @@ class Settings(BaseSettings):
     QDRANT_PORT: int | None = 6333
     QDRANT_API_KEY: SecretStr | None = None
 
+    # LangSimth
+    LANGCHAIN_TRACING_V2: bool = False
+    LANGCHAIN_PROJECT: str = "default"
+    LANGCHAIN_ENDPOINT: Annotated[str, BeforeValidator(check_str_is_http)] = (
+        "https://api.smith.langchain.com"
+    )
+    LANGCHAIN_API_KEY: SecretStr | None = None
+
+    # LangFuse
+    LANGFUSE_TRACING: bool = False
+    LANGFUSE_HOST: Annotated[str, BeforeValidator(check_str_is_http)] = "https://cloud.langfuse.com"
+    LANGFUSE_PUBLIC_KEY: SecretStr | None = None
+    LANGFUSE_SECRET_KEY: SecretStr | None = None
+
     # Long-term memory configuration
     LONG_TERM_MEMORY_ENABLED: bool = True
     # Options: "pg_plus_qdrant", "postgres_only", "qdrant_only"
@@ -192,17 +203,34 @@ class Settings(BaseSettings):
     EMBEDDING_CACHE_ENABLED: bool = True
     EMBEDDING_CACHE_PATH: str = "./data/embedding_cache.json"
 
-    # Azure OpenAI Settings
-    AZURE_OPENAI_API_KEY: SecretStr | None = None
-    AZURE_OPENAI_ENDPOINT: str | None = None
-    AZURE_OPENAI_API_VERSION: str = "2024-02-15-preview"
-    AZURE_OPENAI_DEPLOYMENT_MAP: dict[str, str] = Field(
-        default_factory=dict, description="Map of model names to Azure deployment IDs"
-    )
-
     # RAG 混合检索配置
-    RAG_HYBRID_SEARCH: bool = True       # 是否启用 BM25 + 向量的混合检索（关闭则仅向量检索）
-    RAG_BM25_WEIGHT: float = 0.4         # BM25 在 RRF 融合中的权重（0.0-1.0，越大越偏关键词匹配）
+    # 说明：默认偏向「语义向量检索」，BM25 主要作为兜底补充标题/关键词命中。
+    # 如果你的文档多为合同/规章这类结构化条款，建议适度减小分块尺寸，
+    # 让每个 chunk 更接近「一条/几条条款」，有利于命中精确实体（如甲方/乙方名称）。
+    RAG_CHUNK_SIZE: int = 512           # 文档分块的目标大小（约 768 token，适中偏小）
+    RAG_CHUNK_OVERLAP: int = 64         # 相邻块重叠字符数，保持在 chunk_size 的约 10–15%
+    RAG_DEFAULT_TOP_K: int = 10          # 单次检索返回的最相关文本块数量（向量/混合检索最终截断条数）
+    RAG_HYBRID_SEARCH: bool = True      # 是否启用 BM25 + 向量的混合检索（关闭则仅向量检索）
+    # 将 BM25 权重从 0.4 下调到 0.2，使排序更偏向语义向量结果，BM25 只做轻量辅助。
+    RAG_BM25_WEIGHT: float = 0.2        # BM25 在 RRF 融合中的权重（0.0-1.0，越大越偏关键词匹配）
+    RAG_MIN_RELEVANCE_SCORE: float = 0.005  # 若最高 RRF 分低于此值则本库不返回片段（0=不启用）。知识库与问题域不符时可设约 0.008～0.01 减少无关结果
+    RAG_RERANK_ENABLED: bool = False      # 是否启用 Rerank（通过外部 API，不占宿主机算力）
+    RAG_RERANK_BASE_URL: str = ""         # Rerank 服务地址（如 TEI 或智谱），与 api_key 配合使用
+    RAG_RERANK_API_KEY: SecretStr | None = None  # 可选，智谱等需鉴权时配置
+    RAG_RERANK_MODEL: str = ""            # Rerank 模型名称（供 API 使用，若为空则启用时用默认）
+    RAG_RERANK_TOP_K: int = 6             # Rerank 后保留的最终片段数量
+    RAG_RERANK_TIME_LIMIT: float = 1.0     # Rerank 最长允许耗时（秒）。<=0 表示不限制（使用内部默认超时）
+    RAG_RERANK_MIN_SCORE: float = 0.0      # Rerank 分数下限（默认不启用）。低于此阈值的片段会被剔除
+
+    # DuckDuckGo 网页搜索（FormattedDuckDuckGoSearchResults）
+    # 逻辑：每次调用 WebSearch(query) = 只发 1 次搜索请求；DDGS_TIMEOUT 限制这次调用的总耗时。
+    # DDGS_TOP_K 是「这一次搜索」返回结果经 BM25/去重/过滤后最多保留几条，不是「搜几次」，不会 12*5 秒。
+    DDGS_MAX_RESULTS: int = 5          # 向 API 请求的最大条数（单次请求）
+    DDGS_TOP_K: int = 5                # 单次搜索经 BM25 筛选后最多返回条数
+    DDGS_MIN_SCORE: float = 0.1       # BM25 相关性下限，低于此分数的结果丢弃
+    DDGS_TIMEOUT: float = 12.0         # 单次工具调用的总超时（秒），即一次 WebSearch(query) 的最长等待
+    DDGS_BM25_K1: float = 1.5          # BM25 参数 k1
+    DDGS_BM25_B: float = 0.75          # BM25 参数 b
 
     # 数据清理配置
     CLEANUP_INTERVAL_HOURS: int = 24  # 清理间隔，单位：小时
@@ -307,6 +335,17 @@ class Settings(BaseSettings):
                 case _:
                     raise ValueError(f"Unknown provider: {provider}")
 
+        # Rerank 默认模型：
+        # - TEI / 自建 /rerank 服务通常是“服务绑定模型”，请求体不需要传 model 字段 → 使用 "default"
+        # - 智谱 Rerank 明确要求 model="rerank" → 若 BASE_URL 指向 open.bigmodel.cn 且未显式配置，则设为 "rerank"
+        if self.RAG_RERANK_ENABLED and (self.RAG_RERANK_BASE_URL or "").strip():
+            base = (self.RAG_RERANK_BASE_URL or "").strip()
+            if not (self.RAG_RERANK_MODEL or "").strip():
+                if "open.bigmodel.cn" in base:
+                    self.RAG_RERANK_MODEL = "rerank"
+                else:
+                    self.RAG_RERANK_MODEL = "default"
+
     @computed_field
     @property
     def BASE_URL(self) -> str:
@@ -320,8 +359,7 @@ class Settings(BaseSettings):
     @computed_field
     @property
     def STATIC_DIR(self) -> Path:
-        from pathlib import Path
-        # Returs absolute path using current working directory
+        # Returns absolute path using current working directory
         # Docker: /app/static (WORKDIR is /app)
         # Local: <project_root>/static (assuming run from root)
         return Path("static").absolute()

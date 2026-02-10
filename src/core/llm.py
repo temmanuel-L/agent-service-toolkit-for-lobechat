@@ -10,6 +10,7 @@ from langchain_groq import ChatGroq
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_openai import AzureChatOpenAI, ChatOpenAI, OpenAIEmbeddings
 
+from core.rerank_api import RerankAPIPostprocessor
 from utils.log_utils import get_logger
 from core.settings import settings, is_ollama_reachable
 from schema.models import (
@@ -27,10 +28,12 @@ from schema.models import (
     OpenRouterModelName,
     VertexAIModelName,
     ZhipuModelName,
+    RerankModelName,
 )
 
 logger = get_logger(__name__)
 
+# 仅对话 LLM 使用；Rerank 通过 get_rerank() 单独获取
 _MODEL_TABLE = (
     {m: m.value for m in OpenAIModelName}
     | {m: m.value for m in OpenAICompatibleName}
@@ -46,6 +49,12 @@ _MODEL_TABLE = (
     | {m: m.value for m in ZhipuModelName}
     | {m: m.value for m in FakeModelName}
 )
+
+# Rerank 模型映射表：服务商为 key，模型名为 value（来自 schema.models.RerankModelName）。改模型时只改 schema 与下表 value。
+_RERANK_MODEL_TABLE = {
+    "ollama": RerankModelName.OLLAMA_RERANK.value,
+    "cohere": RerankModelName.COHERE_RERANK.value,
+}
 
 # Embedding 模型映射表
 _EMBEDDING_MODEL_TABLE = {
@@ -242,3 +251,74 @@ def get_embedding_model(embedding_provider: str = "ollama") -> Any:
             pass
 
     raise ValueError("所有 embedding 服务都不可用：Ollama、智谱、DMX 代理服务和 OpenAI API")
+
+
+@cache
+def get_rerank(model_name: RerankModelName | str | None = None) -> Any:
+    """
+    获取 Rerank 后处理器（通过外部 API），供 RAG 精排使用。
+    效仿 get_model/get_embedding_model：base_url + api_key 兼容内网 TEI 或智谱等外网服务，不占宿主机算力。
+
+    参数:
+        model_name: Rerank 模型枚举或字符串。若为空则从 settings.RAG_RERANK_MODEL 读取。
+    返回:
+        若未启用或未配置 BASE_URL 返回 None，否则返回可 postprocess_nodes 的实例。
+    """
+    if not settings.RAG_RERANK_ENABLED:
+        return None
+
+    base_url = (settings.RAG_RERANK_BASE_URL or "").strip().strip("'").strip('"')
+    if not base_url:
+        logger.warning(
+            "Rerank 已启用但未配置 RAG_RERANK_BASE_URL，跳过重排。"
+            "请在 .env 中设置 RAG_RERANK_BASE_URL（例如指向 TEI 的根地址）。"
+        )
+        return None
+
+    m_name = (model_name.value if isinstance(model_name, RerankModelName) else model_name) or settings.RAG_RERANK_MODEL
+    m_name = (m_name or "").strip()
+    if m_name == RerankModelName.OLLAMA_RERANK.value:
+        m_name = _RERANK_MODEL_TABLE.get("ollama", m_name)
+    elif m_name == RerankModelName.COHERE_RERANK.value:
+        m_name = _RERANK_MODEL_TABLE.get("cohere", m_name)
+    if not m_name:
+        m_name = "default"
+
+    api_key = None
+    if settings.RAG_RERANK_API_KEY:
+        # 优先使用专门为 Rerank 配置的 API Key
+        api_key = settings.RAG_RERANK_API_KEY.get_secret_value()
+    # 智谱 Rerank：若未单独配置 RAG_RERANK_API_KEY，则复用 ZHIPU_API_KEY
+    elif "open.bigmodel.cn" in base_url and settings.ZHIPU_API_KEY:
+        api_key = settings.ZHIPU_API_KEY.get_secret_value()
+
+    # 常见误配置提示：Ollama 的 OpenAI-compatible base_url 通常是 /v1，但它不提供 /rerank。
+    if "11434" in base_url and base_url.rstrip("/").endswith("/v1"):
+        logger.warning(
+            "RAG_RERANK_BASE_URL=%s 看起来像 Ollama 的 OpenAI-compatible /v1 地址；"
+            "当前 Rerank 会调用 {base_url}/rerank，请确认你的服务确实提供 /rerank（建议使用 TEI 等重排服务）。",
+            base_url,
+        )
+
+    logger.info(
+        "Rerank 使用外部 API: base_url=%s, model=%s, top_n=%s",
+        base_url,
+        m_name,
+        settings.RAG_RERANK_TOP_K,
+    )
+    # 统一的 Rerank 时间限制（秒）：用于控制一次外部 rerank 调用的最长等待时间
+    # - >0：作为 httpx timeout 传入（更“硬”的限制，避免拖慢请求）
+    # - <=0：不限制，使用 RerankAPIPostprocessor 默认 timeout
+    rr_timeout = float(getattr(settings, "RAG_RERANK_TIME_LIMIT", 0.0) or 0.0)
+    return RerankAPIPostprocessor(
+        base_url=base_url,
+        api_key=api_key,
+        model=m_name,
+        top_n=settings.RAG_RERANK_TOP_K,
+        timeout=rr_timeout if rr_timeout > 0 else 30.0,
+    )
+
+
+def get_postprocessor(model_name: RerankModelName | str | None = None) -> Any:
+    """兼容别名：与 get_rerank 相同。"""
+    return get_rerank(model_name)

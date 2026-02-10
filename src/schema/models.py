@@ -121,6 +121,14 @@ class FakeModelName(StrEnum):
     FAKE = "fake"
 
 
+class RerankModelName(StrEnum):
+    """Placeholder rerank models for local (Ollama) and external APIs."""
+
+    OLLAMA_RERANK = "bge-reranker-v2-m3:latest"  # Placeholder for local rerank
+    COHERE_RERANK = "rerank-english-v3.0"        # Placeholder for external rerank
+
+
+# 仅用于对话的 LLM 枚举；Rerank 使用 RerankModelName，不参与 get_model 分发
 AllModelEnum: TypeAlias = (
     OpenAIModelName
     | OpenAICompatibleName

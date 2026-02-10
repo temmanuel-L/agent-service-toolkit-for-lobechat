@@ -1,6 +1,5 @@
 from typing import Optional
 import asyncio
-import os
 import numexpr
 import math
 import re
@@ -8,6 +7,8 @@ import re
 from langchain_community.tools import DuckDuckGoSearchResults
 from langchain_core.tools import BaseTool, tool
 from pydantic import BaseModel, Field
+
+from core import settings
 
 
 def calculator_func(expression: str) -> str:
@@ -46,31 +47,43 @@ calculator.name = "Calculator"
 
 
 class FormattedDuckDuckGoSearchResults(DuckDuckGoSearchResults):
-    """增强版 DuckDuckGo 搜索工具，支持相关性筛选、去重与数量控制。"""
+    """
+    增强版 DuckDuckGo 搜索工具，支持相关性筛选、去重与数量控制。
+
+    数量、相关性与超时均从 core.settings 读取（对应 .env 中的 DDGS_* 配置）。
+
+    超时与条数逻辑：
+    - 每次调用 WebSearch(query) = 只发 1 次搜索请求；DDGS_TIMEOUT 限制的是这一次调用的总耗时。
+    - DDGS_TOP_K 是「这一次搜索」返回的结果里，经 BM25/去重/过滤后最多保留几条，不会因 TOP_K=5 而发 5 次请求或等 5 倍超时。
+
+    相关性保障：
+    - 仅当结果通过 BM25 且分数 >= DDGS_MIN_SCORE 时才返回；若全部低于阈值（如 API 返回无关内容或多引擎超时后的脏数据），
+      返回明确提示「未找到与您问题相关的结果…」，不再回退到低相关条目，避免答非所问。
+    """
 
     name: str = "WebSearch"
 
     def _run(self, query: str, run_manager=None) -> str | tuple:
-        """执行网页搜索工具，并返回 Markdown 格式结果。"""
-        # 直接使用 api_wrapper 获取结构化数据，而不是解析字符串输出
+        """执行网页搜索工具（单次请求），并返回 Markdown 格式结果。"""
+        # 单次 api_wrapper.results = 单次网络请求，返回最多 max_results 条；后续仅内存内 BM25/去重/截断
         try:
             results = self.api_wrapper.results(query, self.max_results)
             if not results:
                 return "未找到相关结果。"
 
-            max_out = int(os.getenv("DDGS_MAX_RESULTS", str(self.max_results or 5)))
-            top_k = int(os.getenv("DDGS_TOP_K", str(max_out)))
-            min_score = float(os.getenv("DDGS_MIN_SCORE", "0.08"))
-            bm25_k1 = float(os.getenv("DDGS_BM25_K1", "1.5"))
-            bm25_b = float(os.getenv("DDGS_BM25_B", "0.75"))
+            max_out = settings.DDGS_MAX_RESULTS
+            top_k = settings.DDGS_TOP_K
+            min_score = settings.DDGS_MIN_SCORE
+            bm25_k1 = settings.DDGS_BM25_K1
+            bm25_b = settings.DDGS_BM25_B
 
             q_tokens = self._tokenize_list(query)
             scored = self._score_with_bm25(results, q_tokens, k1=bm25_k1, b=bm25_b)
             dedup = self._deduplicate_by_link(scored)
             picked = self._filter_and_rank(dedup, top_k=top_k, min_score=min_score)
+            # 若全部低于 min_score（如 API 返回无关内容、多引擎超时后的脏数据），不再回退到低相关结果，避免返回与问题无关的条目
             if not picked:
-                # 若全部被过滤，回退到去重后的前 max_out 条，避免无输出
-                picked = [r for _, r in dedup][:max(1, max_out)]
+                return "未找到与您问题相关的结果，建议更换关键词或稍后重试。"
 
             results = picked[:max(1, max_out)]
 
@@ -95,8 +108,14 @@ class FormattedDuckDuckGoSearchResults(DuckDuckGoSearchResults):
             return super()._run(query, run_manager)
 
     async def _arun(self, query: str, run_manager=None) -> str | tuple:
-        """异步版本，必要时将同步逻辑放到线程池执行。"""
-        return await asyncio.to_thread(self._run, query, run_manager)
+        """异步版本，带超时以避免因引擎超时导致长时间阻塞。"""
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(self._run, query, run_manager),
+                timeout=settings.DDGS_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            return "网络搜索超时，请稍后重试或换一种问法。"
 
     def _tokenize_list(self, text: str) -> list[str]:
         if not text:
@@ -182,7 +201,7 @@ class FormattedDuckDuckGoSearchResults(DuckDuckGoSearchResults):
         return [r for _, r in filtered[:max(0, top_k)]]
 
 
-web_search = FormattedDuckDuckGoSearchResults()
+web_search = FormattedDuckDuckGoSearchResults(max_results=settings.DDGS_MAX_RESULTS)
 
 
 class VectorSearchInput(BaseModel):

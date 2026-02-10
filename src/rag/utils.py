@@ -14,17 +14,17 @@ from utils.log_utils import get_logger
 logger = get_logger(__name__)
 
 # ============================================================================
-# 配置常量
+# 常量
 # ============================================================================
-RAG_MAX_RESULT_LENGTH = 6000  # 单次检索结果的最大字符数
-RAG_MAX_SEGMENTS_DISPLAY = 5  # 最多显示的段落数
+# 仅保留段落分隔符常量；长度/段落数上限由调用方（如 SearchKnowledgeTool）
+# 基于 RAG_CHUNK_SIZE 和 RAG_DEFAULT_TOP_K 动态计算并传入，避免出现独立的“第二套配额”。
 RAG_SEGMENT_SEPARATOR = "\n\n---\n\n"  # 段落分隔符
 
 
 def truncate_rag_result(
     content: str,
-    max_length: int = RAG_MAX_RESULT_LENGTH,
-    max_segments: int = RAG_MAX_SEGMENTS_DISPLAY
+    max_length: int = 15000,
+    max_segments: int = 20,
 ) -> str:
     """
     截断 RAG 检索结果，确保长度可控

@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Literal
+from typing import Annotated, Literal
 
 from langchain_community.tools import OpenWeatherMapQueryRun
 from langchain_community.utilities import OpenWeatherMapAPIWrapper
@@ -13,6 +13,14 @@ from langgraph.prebuilt import ToolNode
 from agents.llama_guard import LlamaGuard, LlamaGuardOutput, SafetyAssessment
 from agents.tools import calculator, vector_search_tool, web_search
 from core import get_model, settings
+from rag import (
+    create_model_to_tools_router,
+    create_reset_rounds_node,
+    create_tools_node_with_rounds_increment,
+    create_force_done_node,
+    create_rag_evaluator_node,
+    tool_rounds_add_reducer,
+)
 from utils.log_utils import get_logger
 
 logger = get_logger(__name__)
@@ -22,10 +30,13 @@ class AgentState(MessagesState, total=False):
     """`total=False` 来自 PEP589（TypedDict）规范。
 
     文档： https://typing.readthedocs.io/en/latest/spec/typeddict.html#totality
+    tool_rounds 使用显式 reducer 确保合并/持久化后不被丢失。
     """
 
     safety: LlamaGuardOutput
     remaining_steps: RemainingSteps
+    tool_rounds: Annotated[int, tool_rounds_add_reducer]  # 本轮工具轮数，用于轮次上限
+    retrieval_eval: Literal["sufficient", "insufficient", "not_found"]
 
 
 tools = [web_search, calculator, vector_search_tool]
@@ -72,13 +83,22 @@ def format_safety_message(safety: LlamaGuardOutput) -> AIMessage:
 async def acall_model(state: AgentState, config: RunnableConfig) -> AgentState:
     m = get_model(config["configurable"].get("model", settings.DEFAULT_MODEL))
     model_runnable = wrap_model(m)
+    
+    # 追踪当前状态
+    current_rounds = state.get("tool_rounds", 0)
+    logger.info("[State Check][acall_model] entering with tool_rounds=%s", current_rounds)
+    
     response = await model_runnable.ainvoke(state, config)
 
     # 在此处运行 llama guard，避免返回不安全内容
     llama_guard = LlamaGuard()
     safety_output = await llama_guard.ainvoke("Agent", state["messages"] + [response])
     if safety_output.safety_assessment == SafetyAssessment.UNSAFE:
-        return {"messages": [format_safety_message(safety_output)], "safety": safety_output}
+        return {
+            "messages": [format_safety_message(safety_output)],
+            "safety": safety_output,
+            "tool_rounds": 0, # 这里 0 表示本节点不对 tool_rounds 做增量累加（加 0）
+        }
 
     if state["remaining_steps"] < 2 and response.tool_calls:
         return {
@@ -87,10 +107,12 @@ async def acall_model(state: AgentState, config: RunnableConfig) -> AgentState:
                     id=response.id,
                     content="抱歉，需要更多步骤才能处理该请求。",
                 )
-            ]
+            ],
+            "tool_rounds": 0,
         }
-    # 这里返回列表，因为它会被追加到现有消息列表中
-    return {"messages": [response]}
+    
+    # 显式回传 0，在累加式 reducer 模式下 (current + 0 = current)，确保状态不丢失且不增加轮次
+    return {"messages": [response], "tool_rounds": 0}
 
 
 async def llama_guard_input(state: AgentState, config: RunnableConfig) -> AgentState:
@@ -104,11 +126,17 @@ async def block_unsafe_content(state: AgentState, config: RunnableConfig) -> Age
     return {"messages": [format_safety_message(safety)]}
 
 
+# 每轮对话内最多执行的工具轮数（含 WebSearch 等）；至少 3 轮可让模型在两次检索后仍有一次机会做总结或说明“未找到相关结果”
+MAX_TOOL_ROUNDS = 3
+
 # 定义图
 agent = StateGraph(AgentState)
 agent.add_node("model", acall_model)
-agent.add_node("tools", ToolNode(tools))
+agent.add_node("tools", create_tools_node_with_rounds_increment(ToolNode(tools)))
+agent.add_node("evaluator", create_rag_evaluator_node(tool_names=["web_search", "vector_search_tool"]))
+agent.add_node("force_done", create_force_done_node())
 agent.add_node("guard_input", llama_guard_input)
+agent.add_node("reset_rounds", create_reset_rounds_node())
 agent.add_node("block_unsafe_content", block_unsafe_content)
 agent.set_entry_point("guard_input")
 
@@ -124,30 +152,26 @@ def check_safety(state: AgentState) -> Literal["unsafe", "safe"]:
 
 
 agent.add_conditional_edges(
-    "guard_input", check_safety, {"unsafe": "block_unsafe_content", "safe": "model"}
+    "guard_input", check_safety, {"unsafe": "block_unsafe_content", "safe": "reset_rounds"}
 )
+agent.add_edge("reset_rounds", "model")
 
 # 阻断不安全内容后直接结束
 agent.add_edge("block_unsafe_content", END)
 
-# tools 执行后总是回到 model
-agent.add_edge("tools", "model")
+# tools 返回时先经过 evaluator，再回到 model
+agent.add_edge("tools", "evaluator")
+agent.add_edge("evaluator", "model")
+agent.add_edge("force_done", END)
+
+agent.add_conditional_edges(
+    "model",
+    create_model_to_tools_router(max_tool_rounds=MAX_TOOL_ROUNDS),
+    {"tools": "tools", "done": END, "force_done": "force_done"},
+)
 
 
-# model 执行后：若存在工具调用则运行 tools，否则结束
-def pending_tool_calls(state: AgentState) -> Literal["tools", "done"]:
-    last_message = state["messages"][-1]
-    if not isinstance(last_message, AIMessage):
-        raise TypeError(f"Expected AIMessage, got {type(last_message)}")
-    if last_message.tool_calls:
-        return "tools"
-    return "done"
-
-
-agent.add_conditional_edges("model", pending_tool_calls, {"tools": "tools", "done": END})
-
-
-research_assistant = agent.compile()
+research_assistant = agent.compile().with_config({"recursion_limit": 10})
 
 # try:
 #     graph_obj = research_assistant.get_graph()

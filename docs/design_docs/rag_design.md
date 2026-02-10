@@ -25,6 +25,7 @@
 | **混合检索 + RRF** | 向量检索捕获语义；BM25 精确命中关键词；RRF 无需分数归一化即可合并两路结果，并可配置 BM25 权重（RAG_BM25_WEIGHT）。 |
 | **BM25 按需构建与失效** | 首次查询某 kb_id 时从 Qdrant scroll 加载节点并构建 BM25 索引并缓存；新文档摄入或删除知识库时使对应缓存失效，保证结果一致。 |
 | **结果长度与安全** | 检索结果经 truncate_rag_result 截断（字符数 + 段落数），并做 is_low_quality_text 安检，防止脏数据进入 LLM 上下文。 |
+| **最低相关性阈值（可选）** | 知识库与问题域不符时（如库内仅有薪酬报告、用户问「值班安排」），可设 RAG_MIN_RELEVANCE_SCORE（RRF 分约 0.008～0.01），最高分低于阈值则该库不返回片段；无任何片段时返回友好提示。 |
 
 ---
 
@@ -127,6 +128,8 @@ query_knowledge(query_str, kb_ids, similarity_top_k?)
             │       _reciprocal_rank_fusion(vector_nodes, bm25_nodes, top_k, bm25_weight=RAG_BM25_WEIGHT) → final_nodes
             │   else: final_nodes = vector_nodes
             │
+            ├─► 若 RAG_MIN_RELEVANCE_SCORE > 0 且 max(score) < 阈值 → 本库跳过（不加入 all_segments），避免问题域与知识库不符时返回无关片段
+            │
             ├─► 格式化与安检
             │       for node: is_low_quality_text(content) → 剔除
             │       输出 "[Knowledge Segment N]\n{content}"，用 "\n\n---\n\n" 拼接
@@ -194,13 +197,15 @@ query_knowledge(query_str, kb_ids, similarity_top_k?)
 | RAG_DEFAULT_TOP_K | 检索返回的最相关块数 | 8 |
 | RAG_HYBRID_SEARCH | 是否启用混合检索（关闭则仅向量） | True（settings） |
 | RAG_BM25_WEIGHT | BM25 在 RRF 中的权重 (0.0–1.0) | 0.4（settings） |
+| RAG_MIN_RELEVANCE_SCORE | 最高 RRF 分低于此值则该库不返回片段（0=不启用）；混合检索时 RRF 分约 0.01 量级 | 0.0（settings） |
 
 ### 6.2 utils 中的常量
 
-| 常量 | 含义 |
-|------|------|
-| RAG_MAX_RESULT_LENGTH | 单次检索结果最大字符数（truncate_rag_result） | 6000 |
-| RAG_MAX_SEGMENTS_DISPLAY | 最多保留段落数 | 5 |
+> 说明：长度与段落数上限不再通过单独的常量配置，而是由 `SearchKnowledgeTool`
+> 基于 `RAG_CHUNK_SIZE * RAG_DEFAULT_TOP_K` 动态计算并传入 `truncate_rag_result`。
+
+| 常量 | 含义 | 默认 |
+|------|------|------|
 | RAG_SEGMENT_SEPARATOR | 段落分隔符 | "\n\n---\n\n" |
 
 ### 6.3 其他依赖
