@@ -166,15 +166,36 @@ class StreamState:
         # 优化：先检查长度，避免不必要的字符串比较
         if self.streamed_content:
             streamed_stripped = self.streamed_content.strip()
-            
+            logger.info(f"streamed_stripped长度为: {len(streamed_stripped)}")
+            # logger.info(f"streamed_stripped内容为: {streamed_stripped}")
+            logger.info(f"content_stripped长度为: {len(content_stripped)}")
+            # logger.info(f"content_stripped内容为: {content_stripped}")
+
+            # ------------------------原逻辑------------------------
             # 如果流式内容长度 >= 待检查内容长度，可能已经发送过
-            if len(streamed_stripped) >= len(content_stripped):
-                # 完全匹配检查（最常见情况）
-                if content_stripped == streamed_stripped:
-                    return False
-                # 包含检查（内容是流式内容的一部分）
-                if content_stripped in streamed_stripped:
-                    return False
+            # if len(streamed_stripped) >= len(content_stripped):
+            #     # 完全匹配检查（最常见情况）
+            #     if content_stripped == streamed_stripped:
+            #         return False
+            #     # 包含检查（内容是流式内容的一部分）
+            #     if content_stripped in streamed_stripped:
+            #         return False
+            # else:
+            #     if streamed_stripped in content_stripped:
+            #         return False
+
+            # -----------------------新逻辑-------------------------
+            # 核心改进：计算重合度或判断长度近似值
+            # 如果完整消息内容的 95% 以上都已经发送过了，就认为它是重复的
+            # 如果最终消息的很长一部分（比如前200个字）已经出现在已发送流中
+            # 或者已发送流的长度远超最终消息，基本可以断定是重复
+            if content_stripped[:200] in streamed_stripped or streamed_stripped[:200] in content_stripped:
+                logger.info("检测到高度重合，拦截重复消息")
+                return False
+
+            # 兜底：如果长度差异巨大且前缀相似
+            if len(streamed_stripped) > len(content_stripped) and streamed_stripped.find(content_stripped[:100]) != -1:
+                return False
         
         return True
     

@@ -16,6 +16,7 @@ from agents.rag_assistant.rag_assistant import rag_assistant
 from agents.research_assistant.research_assistant import research_assistant
 from agents.simple_travel_planner_agent.simple_travel_planner_agent import simple_travel_planner_agent
 from agents.music_composer.music_composer import music_composer_agent
+from agents.parallelization.parallelization_agent import parallelization_agent
 from schema import AgentInfo
 
 DEFAULT_AGENT = "chatbot"
@@ -71,6 +72,10 @@ agents: dict[str, Agent] = {
         description="An AI music composer that generates MIDI files based on style, mood, and key.",
         graph_like=music_composer_agent,
     ),
+    "parallelization-agent": Agent(
+        description="An agent which can do multiple tasks in parallelization",
+        graph_like=parallelization_agent,
+    )
 }
 
 
