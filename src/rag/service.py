@@ -22,24 +22,33 @@ import tempfile
 import threading
 import tiktoken
 import logging
-from typing import Optional, List
+from typing import Optional, List, Any
 
 # 屏蔽第三方库冗长的调试日志
 logging.getLogger("llama_index").setLevel(logging.WARNING)
 logging.getLogger("bm25s").setLevel(logging.WARNING)
 
-from llama_index.core import VectorStoreIndex, StorageContext, SimpleDirectoryReader
+from llama_index.core import VectorStoreIndex, StorageContext
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.schema import TextNode, NodeWithScore, QueryBundle
 from llama_index.retrievers.bm25 import BM25Retriever
 from llama_index.vector_stores.qdrant import QdrantVectorStore
 from llama_index.embeddings.langchain import LangchainEmbedding
 from qdrant_client import QdrantClient, AsyncQdrantClient
+from qdrant_client import models as qdrant_models
 from urllib.parse import urlparse
 
 from core.settings import settings
-from core.llm import get_embedding_model, get_rerank
+from core.llm import get_embedding_model
 from utils.log_utils import get_logger
+
+# RAG 子模块：解析与知识库级元数据
+from rag.parsing import parse_file_to_documents
+from rag import kb_metadata
+from rag.rerank import rerank_nodes
+from rag.search.fusion import reciprocal_rank_fusion
+from rag.search import hybrid_search_single_kb
+from rag.schema.schema_search import SearchRequest
 
 logger = get_logger(__name__)
 
@@ -120,116 +129,6 @@ def _looks_like_english_title_query(text: str) -> bool:
     return True
 
 
-# ============================================================================
-# Reciprocal Rank Fusion (RRF)
-# ============================================================================
-def _reciprocal_rank_fusion(
-    vector_results: list[NodeWithScore],
-    bm25_results: list[NodeWithScore],
-    top_k: int,
-    rrf_k: int = 60,
-    bm25_weight: float = 0.4,  # Configurable weight
-) -> list[NodeWithScore]:
-    """
-    Weighted Reciprocal Rank Fusion (W-RRF).
-    
-    改进：添加权重参数，允许调节 Vector vs BM25 的影响力。
-    Score = (1 - w) * RR_vector + w * RR_bm25
-    RR = 1 / (k + rank)
-    """
-    # node_id → (累积 RRF 分数, NodeWithScore 对象)
-    score_map: dict[str, float] = {}
-    node_map: dict[str, NodeWithScore] = {}
-    
-    # Vector results (Weight: 1.0 - bm25_weight)
-    vec_w = 1.0 - bm25_weight
-    for rank, nws in enumerate(vector_results):
-        nid = nws.node.node_id
-        score = vec_w * (1.0 / (rrf_k + rank + 1))
-        score_map[nid] = score_map.get(nid, 0.0) + score
-        if nid not in node_map:
-            node_map[nid] = nws
-
-    # BM25 results (Weight: bm25_weight)
-    for rank, nws in enumerate(bm25_results):
-        nid = nws.node.node_id
-        score = bm25_weight * (1.0 / (rrf_k + rank + 1))
-        score_map[nid] = score_map.get(nid, 0.0) + score
-        if nid not in node_map:
-            node_map[nid] = nws
-
-    # 按 RRF 分数降序排列，取 top_k
-    sorted_ids = sorted(score_map.keys(), key=lambda x: score_map[x], reverse=True)
-    fused = []
-    for nid in sorted_ids[:top_k]:
-        nws = node_map[nid]
-        fused.append(NodeWithScore(node=nws.node, score=score_map[nid]))
-
-    return fused
-
-
-# ============================================================================
-# 文档标题提取
-# ============================================================================
-def _extract_doc_title(file_path: str, documents: list, file_name: str | None) -> str:
-    """
-    从文档中提取标题，用于注入到每个 chunk 的元数据。
-
-    提取优先级：
-    1. PDF 元数据中的 title 字段（pypdf）
-    2. 文档首页前 5 行中最适合做标题的行（短、非空、非页码）
-    3. 文件名去扩展名（兜底）
-
-    标题会被注入到每个 chunk 的 metadata["doc_title"] 中，
-    使得 embedding 包含文档标题信息。这解决了标题页文本短小、
-    在纯向量检索中排名低的问题。
-
-    Args:
-        file_path: 临时文件的本地路径
-        documents: SimpleDirectoryReader 加载的文档列表
-        file_name: 原始文件名（可选）
-
-    Returns:
-        提取到的文档标题字符串，提取失败时返回空字符串
-    """
-    ext = os.path.splitext(file_path)[1].lower()
-
-    # ---- 策略 1: PDF 元数据 ----
-    if ext == ".pdf":
-        try:
-            from pypdf import PdfReader
-            reader = PdfReader(file_path)
-            meta = reader.metadata
-            if meta and meta.title and meta.title.strip():
-                title = meta.title.strip()
-                logger.debug(f"从 PDF 元数据提取标题: '{title[:80]}'")
-                return title
-        except Exception:
-            pass  # PDF 元数据不可用，继续尝试其他策略
-
-    # ---- 策略 2: 从首页内容中启发式提取 ----
-    if documents:
-        first_text = documents[0].text[:1000]
-        lines = [line.strip() for line in first_text.split('\n') if line.strip()]
-        # 跳过纯数字行（页码）、过长行（正文段落）
-        for line in lines[:8]:
-            # 好的标题特征：长度适中（10-300 字符），不以数字开头（排除页码）
-            if 5 < len(line) < 300 and not line[0].isdigit():
-                logger.debug(f"从首页内容提取标题: '{line[:80]}'")
-                return line
-
-    # ---- 策略 3: 从文件名推断 ----
-    if file_name:
-        name_without_ext = os.path.splitext(file_name)[0]
-        # 替换常见分隔符为空格
-        title = re.sub(r'[_\-]+', ' ', name_without_ext).strip()
-        if title:
-            logger.debug(f"从文件名推断标题: '{title[:80]}'")
-            return title
-
-    return ""
-
-
 class RagService:
     """
     RAG 服务：文档摄入 + 混合检索。
@@ -258,7 +157,7 @@ class RagService:
         # 将 LangChain 嵌入模型封装为 LlamaIndex 格式
         lc_embeddings = get_embedding_model()
         # 1) Token 批处理：防止批量 embedding 超过模型上下文限制（如 8192）
-        from rag.embedding_batcher import TokenAwareEmbedding, CacheAwareEmbedding
+        from rag.chunking.embedding_batcher import TokenAwareEmbedding, CacheAwareEmbedding
         token_aware = TokenAwareEmbedding(
             lc_embeddings,
             max_batch_tokens=6000,
@@ -416,58 +315,16 @@ class RagService:
                 logger.error(f"BM25 索引构建失败: collection='{kb_id}': {e}")
                 return None, 0
 
+    # _rerank_nodes 方法已迁移到 rag.rerank.rerank_nodes，为保持兼容保留一个薄封装。
     def _rerank_nodes(
         self,
         nodes: list[NodeWithScore],
         query_str: str,
         top_k: int,
     ) -> list[NodeWithScore]:
-        """
-        使用 Rerank 模型对候选节点进行精排，返回按相关性重排后的 top_k。
-        若未启用或模型不可用，直接按原分数截断返回。
-        """
-        postprocessor = get_rerank()
-        if not postprocessor or not nodes:
-            return nodes[:top_k]
-        try:
-            t0 = time.perf_counter()
-            query_bundle = QueryBundle(query_str=query_str)
-            reranked = postprocessor.postprocess_nodes(nodes, query_bundle=query_bundle)
+        from rag.rerank import rerank_nodes as _rr
 
-            # ---- Rerank 时间限制（兜底）----
-            # 主要限制由 httpx timeout 保证（在 get_rerank 中注入），这里再做一次兜底：
-            # 如果调用“返回得太慢”（例如服务端处理超时但仍返回），则放弃结果并降级。
-            limit_s = float(getattr(settings, "RAG_RERANK_TIME_LIMIT", 0.0) or 0.0)
-            elapsed_s = time.perf_counter() - t0
-            if limit_s > 0 and elapsed_s > limit_s:
-                logger.warning(
-                    "Rerank 超时(%.2fs>%.2fs)，降级为原序截断: kb_nodes=%d",
-                    elapsed_s,
-                    limit_s,
-                    len(nodes),
-                )
-                return nodes[:top_k]
-
-            reranked = reranked[:top_k]
-
-            # ---- Rerank 最低分过滤（可选）----
-            # 注意：不同供应商的分数尺度可能不同；仅在显式配置阈值时启用过滤。
-            min_score = float(getattr(settings, "RAG_RERANK_MIN_SCORE", 0.0) or 0.0)
-            if min_score > 0 and reranked:
-                kept = [n for n in reranked if float(getattr(n, "score", 0.0) or 0.0) >= min_score]
-                if not kept:
-                    logger.warning(
-                        "Rerank 结果全部低于阈值(min_score=%.4f)，降级为原序截断: top_k=%d",
-                        min_score,
-                        top_k,
-                    )
-                    return nodes[:top_k]
-                return kept
-
-            return reranked
-        except Exception as e:
-            logger.warning(f"Rerank 执行失败，降级为原序截断: {e}")
-            return nodes[:top_k]
+        return _rr(nodes, query_str, top_k)
 
     def invalidate_bm25_cache(self, kb_id: str) -> None:
         """
@@ -518,33 +375,22 @@ class RagService:
             tmp_path = tmp.name
 
         try:
-            logger.info(f"Loading document from temp file: {tmp_path}")
-            # 3. 使用 SimpleDirectoryReader 加载数据（自动支持 PDF、Docx、PPTX、HTML 等）
-            reader = SimpleDirectoryReader(input_files=[tmp_path])
-            documents = reader.load_data()
+            # 3. 使用解析子模块加载数据并注入统一文档级元数据（在分块之前完成）
+            from rag.schema import DocumentMetadata  # 仅用于类型提示与日志，无运行时依赖
+
+            documents, doc_meta = parse_file_to_documents(
+                tmp_path,
+                kb_id=kb_id,
+                file_name=file_name,
+                file_url=file_url,
+            )
 
             if not documents:
                 logger.warning(f"No content extracted from {file_name or file_url}")
                 return 0
 
-            # 4. 提取文档标题，并注入到元数据中（文本本身保持只读，避免依赖具体实现）
-            #    - 元数据用于后续 BM25 前缀拼接与日志展示
-            #    - 向量侧仍按 LlamaIndex 默认方式处理文本与元数据
-            doc_title = _extract_doc_title(tmp_path, documents, file_name)
-
-            for doc in documents:
-                # 元数据写入 metadata，便于后续引用和调试
-                if doc_title:
-                    doc.metadata["doc_title"] = doc_title
-                if file_name:
-                    doc.metadata["file_name"] = file_name
-
-                # 确保所有元数据参与 embedding 和 LLM 上下文（不排除任何 key）
-                doc.excluded_embed_metadata_keys = []
-                doc.excluded_llm_metadata_keys = []
-
-            if doc_title:
-                logger.info(f"文档标题: '{doc_title[:80]}'")
+            if isinstance(doc_meta, DocumentMetadata) and doc_meta.doc_title:
+                logger.info(f"文档标题: '{doc_meta.doc_title[:80]}'")
 
             logger.info(
                 f"Extracted {len(documents)} document pages/segments. "
@@ -561,17 +407,15 @@ class RagService:
             )
             storage_context = StorageContext.from_defaults(vector_store=vector_store)
 
-            # 使用 tiktoken 进行基于 Token 的精准分块
-            # 相比默认的基于字符分块，这能确保每个 chunk 严格适配 Embedding 模型的上下文窗口
-            splitter = SentenceSplitter(
-                chunk_size=settings.RAG_CHUNK_SIZE,
-                chunk_overlap=settings.RAG_CHUNK_OVERLAP,
-                tokenizer=tiktoken.get_encoding("cl100k_base").encode
-            )
-            transformations = [splitter]
+            # 分块策略统一由 chunking 子模块管理，便于后续扩展父子分块等高级策略
+            from rag.chunking import build_chunking_transformations
+
+            transformations = build_chunking_transformations()
             logger.info(
-                f"使用基于Token的分块: chunk_size={settings.RAG_CHUNK_SIZE}, "
-                f"chunk_overlap={settings.RAG_CHUNK_OVERLAP} (cl100k_base)"
+                "使用分块策略: strategy=%s, chunk_size=%d, chunk_overlap=%d",
+                getattr(settings, "RAG_CHUNKING_STRATEGY", "simple"),
+                settings.RAG_CHUNK_SIZE,
+                settings.RAG_CHUNK_OVERLAP,
             )
 
             # 6. 创建索引（解析 + 嵌入 + 写入）
@@ -585,6 +429,24 @@ class RagService:
 
             # 7. 失效 BM25 缓存，下次查询时自动重建
             self.invalidate_bm25_cache(kb_id)
+
+            # 8. 保存知识库元数据到 PostgreSQL
+            try:
+                # 获取当前已存在的文件列表
+                existing_metadata = await kb_metadata.get_kb_metadata(kb_id)
+                if existing_metadata:
+                    # 追加新文件
+                    await kb_metadata.add_file_to_kb_metadata(
+                        kb_id, file_name or "unknown", file_url
+                    )
+                else:
+                    # 新建元数据记录
+                    await kb_metadata.save_kb_metadata(
+                        kb_id, [file_name or "unknown"], [file_url]
+                    )
+            except Exception as meta_err:
+                # 元数据保存失败不应阻塞主流程，仅记录警告
+                logger.warning(f"Failed to save KB metadata (non-fatal): {meta_err}")
 
             logger.info(f"Successfully ingested {len(documents)} pages/nodes into collection '{collection_name}'")
             return len(documents)
@@ -606,18 +468,94 @@ class RagService:
     # 知识库删除
     # ================================================================
     async def delete_knowledge_base(self, kb_id: str) -> bool:
-        """从 Qdrant 中删除整个集合（知识库），同时清除 BM25 缓存。"""
+        """
+        删除知识库：同步删除 Qdrant Collection、BM25缓存和 PostgreSQL 元数据。
+        """
         try:
+            logger.info(f"Starting delete_knowledge_base: kb_id={kb_id}")
+            
+            # 1. 删除 Qdrant Collection
             if self.client.collection_exists(kb_id):
-                logger.info(f"Deleting collection: {kb_id}")
+                logger.info(f"Deleting Qdrant collection: {kb_id}")
                 self.client.delete_collection(kb_id)
-                self.invalidate_bm25_cache(kb_id)
-                return True
+                logger.info(f"Successfully deleted Qdrant collection: {kb_id}")
             else:
-                logger.warning(f"Collection {kb_id} does not exist, nothing to delete.")
-                return False
+                logger.warning(f"Collection {kb_id} does not exist in Qdrant")
+
+            # 2. 清除 BM25 缓存
+            logger.info(f"Invalidating BM25 cache for kb_id={kb_id}")
+            self.invalidate_bm25_cache(kb_id)
+
+            # 3. 删除 PostgreSQL 元数据
+            try:
+                logger.info(f"Deleting KB metadata from PostgreSQL: kb_id={kb_id}")
+                await kb_metadata.delete_kb_metadata(kb_id)
+                logger.info(f"Successfully deleted KB metadata from PostgreSQL: kb_id={kb_id}")
+            except Exception as meta_err:
+                # 元数据删除失败不应阻塞主流程，仅记录警告
+                logger.warning(f"Failed to delete KB metadata in PG (non-fatal): {meta_err}")
+
+            logger.info(f"delete_knowledge_base completed successfully: kb_id={kb_id}")
+            return True
         except Exception as e:
-            logger.error(f"Error deleting collection {kb_id}: {str(e)}")
+            logger.error(f"Error deleting knowledge base {kb_id}: {str(e)}", exc_info=True)
+            return False
+
+    # ================================================================
+    # 知识库文件删除
+    # ================================================================
+    async def delete_file_from_knowledge_base(self, kb_id: str, file_name: str) -> bool:
+        """
+        删除知识库中的指定文件：删除 Qdrant 中该文件的 chunks、BM25缓存失效、更新 PostgreSQL 元数据。
+
+        Args:
+            kb_id: 知识库ID
+            file_name: 要删除的文件名
+
+        Returns:
+            bool: 操作是否成功
+        """
+        try:
+            logger.info(f"Starting delete_file_from_knowledge_base: kb_id={kb_id}, file_name={file_name}")
+            
+            # 1. 从 Qdrant 中删除该文件的 points (通过 metadata filter)
+            if self.client.collection_exists(kb_id):
+                logger.info(f"Deleting file from Qdrant collection: kb_id={kb_id}, file_name={file_name}")
+                # 使用 filter 直接删除特定 file_name 的 points
+                try:
+                    self.client.delete(
+                        collection_name=kb_id,
+                        points_selector=qdrant_models.Filter(
+                            must=[
+                                qdrant_models.FieldCondition(
+                                    key="file_name",
+                                    match=qdrant_models.MatchValue(value=file_name)
+                                )
+                            ]
+                        )
+                    )
+                    logger.info(f"Successfully deleted points from Qdrant for file: {file_name}")
+                except Exception as delete_err:
+                    logger.warning(f"Failed to delete points from Qdrant: {delete_err}")
+            else:
+                logger.warning(f"Collection {kb_id} does not exist in Qdrant")
+
+            # 2. 清除 BM25 缓存
+            logger.info(f"Invalidating BM25 cache for kb_id={kb_id}")
+            self.invalidate_bm25_cache(kb_id)
+
+            # 3. 从 PostgreSQL 元数据中删除文件记录
+            try:
+                logger.info(f"Deleting file from KB metadata in PostgreSQL: kb_id={kb_id}, file_name={file_name}")
+                await kb_metadata.delete_file_from_kb_metadata(kb_id, file_name)
+                logger.info(f"Successfully deleted file from KB metadata in PostgreSQL: {file_name}")
+            except Exception as meta_err:
+                logger.warning(f"Failed to delete file from KB metadata in PG (non-fatal): {meta_err}")
+
+            logger.info(f"delete_file_from_knowledge_base completed: kb_id={kb_id}, file_name={file_name}")
+            return True
+        except Exception as e:
+            logger.error(f"Error deleting file from knowledge base: kb_id={kb_id}, file_name={file_name}, error={str(e)}", exc_info=True)
             return False
 
     # ================================================================
@@ -660,6 +598,38 @@ class RagService:
             f"top_k={similarity_top_k}, mode={mode_label}"
         )
 
+        # ---- 可选 HyDE Query 改写（仅影响向量检索，不改变原始 query 日志与 BM25 查询）----
+        effective_query = query_str
+        if getattr(settings, "RAG_HYDE_ENABLED", False) and getattr(settings, "RAG_HYDE_NUM_VARIANTS", 0) > 0:
+            try:
+                from rag.HyDE import generate_hyde_variants
+
+                hyde_result = await generate_hyde_variants(
+                    query_str,
+                    num_variants=settings.RAG_HYDE_NUM_VARIANTS,
+                )
+                if hyde_result.variants:
+                    # 暂时采用首条改写作为向量检索查询，后续可在 search 模块内部支持多路改写融合
+                    effective_query = hyde_result.variants[0].text
+                    logger.info(
+                        "HyDE 已启用，使用首条改写作为向量检索查询，示例: %s",
+                        effective_query[:80].replace("\n", " "),
+                    )
+            except Exception as hyde_err:
+                logger.warning(f"HyDE 改写失败，降级为原始查询: {hyde_err}")
+
+        # ---- 可选 Query → filters 推断（仅用于 metadata 级过滤）----
+        inferred_filters: dict[str, Any] = {}
+        if getattr(settings, "RAG_QUERY_FILTER_INFERENCE_ENABLED", False):
+            try:
+                from rag.search.filters import infer_filters_from_query
+
+                inferred_filters = infer_filters_from_query(query_str)
+                if inferred_filters:
+                    logger.info("Query filter inference enabled, inferred filters: %s", inferred_filters)
+            except Exception as filter_err:
+                logger.warning(f"Query filter inference failed, skip filters: {filter_err}")
+
         all_segments: list[str] = []
         segment_count = 1
 
@@ -672,152 +642,106 @@ class RagService:
 
                 t0 = time.perf_counter()
 
-                # ---- 向量检索（始终执行）----
+                # ---- 构造向量存储 ----
                 vector_store = QdrantVectorStore(
                     collection_name=kb_id,
                     aclient=self.aclient,
                     client=None,
                 )
-                index = VectorStoreIndex.from_vector_store(
-                    vector_store=vector_store,
-                    embed_model=self.embed_model,
-                )
-                # 第一阶段召回使用「放大的 top_k」：
-                # - 召回阶段适度放宽（如 3～5 倍），提高跨文档命中率；
-                # - 最终返回给 LLM 的仍然是 similarity_top_k 条，保证上下文长度可控。
+
+                # 第一阶段召回使用「放大的 top_k」
                 base_multiplier = 3
                 recall_top_k = similarity_top_k * base_multiplier
-                # 对英文论文/报告标题类查询，进一步放大召回范围，避免被其它英文长文档「淹没」。
-                if _looks_like_english_title_query(query_str):
+                if _looks_like_english_title_query(effective_query):
                     recall_top_k = max(recall_top_k, similarity_top_k * 6)
-                # 安全上限，避免在极大语料库上一次性召回过多候选
                 recall_top_k = min(recall_top_k, 80)
-                vector_retriever = index.as_retriever(similarity_top_k=recall_top_k)
-                vector_nodes = await vector_retriever.aretrieve(query_str)
+
+                # ---- BM25 构造（可选）----
+                bm25 = None
+                corpus_size = 0
+                if hybrid_enabled:
+                    bm25, corpus_size = self._get_or_build_bm25(kb_id, recall_top_k)
+
+                # ---- 调用 search 子模块执行单库检索 ----
+                search_req = SearchRequest(
+                    query=effective_query,
+                    kb_ids=[kb_id],
+                    top_k=recall_top_k,
+                    filters=inferred_filters,
+                )
+
+                search_result = await hybrid_search_single_kb(
+                    search_req,
+                    kb_id=kb_id,
+                    vector_store=vector_store,
+                    embed_model=self.embed_model,
+                    bm25_retriever=bm25 if hybrid_enabled and bm25 is not None else None,
+                    corpus_size=corpus_size,
+                )
+
+                # 转换回 NodeWithScore 列表，后续沿用原有 rerank / 阈值 / 拼装逻辑
+                from llama_index.core.schema import TextNode
+
+                vector_nodes: list[NodeWithScore] = []
+                for hit in search_result.hits:
+                    node = TextNode(text=hit.text, metadata=hit.metadata)
+                    vector_nodes.append(NodeWithScore(node=node, score=hit.score))
 
                 vector_ms = (time.perf_counter() - t0) * 1000
 
-                # ---- BM25 检索（仅混合模式）或 Rerank（纯向量时也可用）----
-                final_nodes = vector_nodes  # 默认使用纯向量结果
-
-                if hybrid_enabled:
-                    t1 = time.perf_counter()
-                    bm25, corpus_size = self._get_or_build_bm25(kb_id, recall_top_k)
-                    if bm25 is not None:
-                        try:
-                            # 动态调整 top_k，确保不超过语料库大小
-                            effective_top_k = min(recall_top_k, corpus_size)
-                            if effective_top_k < recall_top_k:
-                                bm25._similarity_top_k = effective_top_k
-                                logger.info(
-                                    f"BM25 top_k 动态调整: {recall_top_k} -> {effective_top_k} "
-                                    f"(corpus_size={corpus_size})"
-                                )
-                            
-                            bm25_nodes = bm25.retrieve(query_str)
-                            bm25_ms = (time.perf_counter() - t1) * 1000
-
-                            # ---- RRF 融合 ----
-                            # 从配置读取 BM25 权重，允许动态调整关键词匹配的重要性，
-                            # 并在特定查询（如英文论文标题）时临时提升 BM25 的相对权重。
-                            bm25_weight = settings.RAG_BM25_WEIGHT
-                            if _looks_like_english_title_query(query_str):
-                                # 对英文标题/论文题目类查询，更依赖精确关键词匹配，
-                                # 适度放大 BM25 的影响力，增强对标题/抬头的命中率。
-                                bm25_weight = min(0.7, max(bm25_weight, 0.4))
-
-                            fused_nodes = _reciprocal_rank_fusion(
-                                vector_nodes, bm25_nodes, recall_top_k,
-                                bm25_weight=bm25_weight,
-                            )
-
-                            # ---- Rerank 精排（若启用）或启发式加权重排 ----
-                            # 说明：不在此处额外调用 get_rerank() 做布尔判断，避免同一次查询重复构造/重复日志；
-                            # 实际是否可用由 _rerank_nodes 内部处理（未配置/不可用会自动降级为原序截断）。
-                            if settings.RAG_RERANK_ENABLED:
-                                rerank_top_k = min(settings.RAG_RERANK_TOP_K, similarity_top_k)
-                                t_rerank = time.perf_counter()
-                                final_nodes = self._rerank_nodes(
-                                    fused_nodes, query_str, top_k=rerank_top_k
-                                )
-                                rerank_ms = (time.perf_counter() - t_rerank) * 1000
-                                top_scores = [f"{n.score:.4f}" for n in final_nodes[:3]]
-                                total_ms = (time.perf_counter() - t0) * 1000
-                                logger.info(
-                                    f"混合检索+Rerank: kb={kb_id}, "
-                                    f"vector={len(vector_nodes)}({vector_ms:.0f}ms), "
-                                    f"bm25={len(bm25_nodes)}({bm25_ms:.0f}ms), "
-                                    f"rerank={len(final_nodes)}({rerank_ms:.0f}ms), "
-                                    f"TopScores(Rerank)={top_scores}, total={total_ms:.0f}ms"
-                                )
-                            else:
-                                # 启发式元数据/实体加权重排（Rerank 未启用时）
-                                q_lower = query_str.lower()
-                                boosted_nodes: list[NodeWithScore] = []
-                                for nws in fused_nodes:
-                                    boost = 0.0
-                                    meta = getattr(nws.node, "metadata", {}) or {}
-                                    title = str(meta.get("doc_title", "")).lower()
-                                    fname = str(meta.get("file_name", "")).lower()
-
-                                    if title and len(q_lower) > 10 and q_lower in title:
-                                        boost += 0.5 * nws.score
-                                    if fname and len(q_lower) > 10 and q_lower.replace(" ", "") in fname.replace(" ", ""):
-                                        boost += 0.3 * nws.score
-
-                                    content_sample = (getattr(nws.node, "text", "") or "").strip()[:200]
-                                    if any(kw in q_lower for kw in ["谁", "名称", "是谁", "叫什么", "哪家"]):
-                                        if any(pattern in content_sample for pattern in ["甲方:", "甲方：", "乙方:", "乙方：", "委托方", "受托方", "（甲方）", "（乙方）"]):
-                                            boost += 0.4 * nws.score
-
-                                    boosted_nodes.append(NodeWithScore(
-                                        node=nws.node,
-                                        score=nws.score + boost,
-                                    ))
-
-                                boosted_nodes.sort(key=lambda x: x.score, reverse=True)
-                                final_nodes = boosted_nodes[:similarity_top_k]
-                                top_scores = [f"{n.score:.4f}" for n in final_nodes[:3]]
-                                total_ms = (time.perf_counter() - t0) * 1000
-                                logger.info(
-                                    f"混合检索: kb={kb_id}, "
-                                    f"vector={len(vector_nodes)}({vector_ms:.0f}ms), "
-                                    f"bm25={len(bm25_nodes)}({bm25_ms:.0f}ms), "
-                                    f"fused={len(final_nodes)}, TopScores(RRF)={top_scores}, total={total_ms:.0f}ms"
-                                )
-                        except Exception as bm25_err:
-                            # BM25 检索失败，降级为纯向量检索
-                            logger.warning(
-                                f"BM25 检索失败，降级为纯向量检索: kb={kb_id}, error={bm25_err}"
-                            )
-                    else:
-                        # BM25 构建失败，降级为纯向量检索并截断/可选 Rerank
-                        logger.warning(f"BM25 不可用，降级为纯向量检索: kb={kb_id}")
-                        if settings.RAG_RERANK_ENABLED:
-                            rerank_top_k = min(settings.RAG_RERANK_TOP_K, similarity_top_k)
-                            final_nodes = self._rerank_nodes(
-                                vector_nodes, query_str, top_k=rerank_top_k
-                            )
-                        else:
-                            final_nodes = vector_nodes[:similarity_top_k]
+                # ---- Rerank 或启发式重排 ----
+                final_nodes = vector_nodes
+                if settings.RAG_RERANK_ENABLED:
+                    rerank_top_k = min(settings.RAG_RERANK_TOP_K, similarity_top_k)
+                    t_rerank = time.perf_counter()
+                    final_nodes = self._rerank_nodes(
+                        vector_nodes, query_str, top_k=rerank_top_k
+                    )
+                    rerank_ms = (time.perf_counter() - t_rerank) * 1000
+                    total_ms = (time.perf_counter() - t0) * 1000
+                    logger.info(
+                        "检索+Rerank: kb=%s, vector=%d(%.0fms), rerank=%d(%.0fms), total=%.0fms",
+                        kb_id,
+                        len(vector_nodes),
+                        vector_ms,
+                        len(final_nodes),
+                        rerank_ms,
+                        total_ms,
+                    )
                 else:
-                    # 纯向量模式：仍可启用 Rerank 精排
-                    if settings.RAG_RERANK_ENABLED:
-                        rerank_top_k = min(settings.RAG_RERANK_TOP_K, similarity_top_k)
-                        t_rerank = time.perf_counter()
-                        final_nodes = self._rerank_nodes(
-                            vector_nodes, query_str, top_k=rerank_top_k
-                        )
-                        rerank_ms = (time.perf_counter() - t_rerank) * 1000
-                        total_ms = (time.perf_counter() - t0) * 1000
-                        logger.info(
-                            f"向量检索+Rerank: kb={kb_id}, "
-                            f"vector={len(vector_nodes)}({vector_ms:.0f}ms), "
-                            f"rerank={len(final_nodes)}({rerank_ms:.0f}ms), total={total_ms:.0f}ms"
-                        )
-                    else:
-                        final_nodes = vector_nodes[:similarity_top_k]
-                    logger.debug(f"向量检索: kb={kb_id}, results={len(final_nodes)}, elapsed={vector_ms:.0f}ms")
+                    # 启发式元数据/实体加权重排（Rerank 未启用时）
+                    q_lower = query_str.lower()
+                    boosted_nodes: list[NodeWithScore] = []
+                    for nws in vector_nodes:
+                        boost = 0.0
+                        meta = getattr(nws.node, "metadata", {}) or {}
+                        title = str(meta.get("doc_title", "")).lower()
+                        fname = str(meta.get("file_name", "")).lower()
+
+                        if title and len(q_lower) > 10 and q_lower in title:
+                            boost += 0.5 * nws.score
+                        if fname and len(q_lower) > 10 and q_lower.replace(" ", "") in fname.replace(" ", ""):
+                            boost += 0.3 * nws.score
+
+                        content_sample = (getattr(nws.node, "text", "") or "").strip()[:200]
+                        if any(kw in q_lower for kw in ["谁", "名称", "是谁", "叫什么", "哪家"]):
+                            if any(pattern in content_sample for pattern in ["甲方:", "甲方：", "乙方:", "乙方：", "委托方", "受托方", "（甲方）", "（乙方）"]):
+                                boost += 0.4 * nws.score
+
+                        boosted_nodes.append(NodeWithScore(
+                            node=nws.node,
+                            score=nws.score + boost,
+                        ))
+
+                    boosted_nodes.sort(key=lambda x: x.score, reverse=True)
+                    final_nodes = boosted_nodes[:similarity_top_k]
+                    total_ms = (time.perf_counter() - t0) * 1000
+                    logger.info(
+                        "检索(启发式重排): kb=%s, results=%d, total=%.0fms",
+                        kb_id,
+                        len(final_nodes),
+                        total_ms,
+                    )
 
                 # ---- 最低相关性阈值（可选）：知识库与问题域不符时避免返回无关片段 ----
                 min_score = getattr(settings, "RAG_MIN_RELEVANCE_SCORE", 0.0) or 0.0
@@ -830,29 +754,13 @@ class RagService:
                         continue
 
                 # ---- 格式化结果 ----
-                # Log detailed results for debugging (preview first 100 chars)
-                from memory.utils import is_low_quality_text
-                
-                for i, nws in enumerate(final_nodes):
-                    content = nws.text.strip()
-                    
-                    # [CRITICAL] 知识库内容安检
-                    if is_low_quality_text(content):
-                        logger.warning(f"检测到 RAG 检索结果包含脏数据 (Score: {nws.score:.4f}, 已剔除): {content[:50]}...")
-                        continue
+                from rag.postprocess.segments import build_segments_from_nodes
 
-                    # 获取元数据用于日志追踪
-                    meta = getattr(nws.node, "metadata", {}) or {}
-                    source_label = meta.get("doc_title") or meta.get("file_name") or "unknown_source"
-                    
-                    # Preview for logs: first 100 chars
-                    preview = content[:100].replace('\n', ' ') + "..." if len(content) > 100 else content.replace('\n', ' ')
-                    
-                    logger.debug(f"  [Segment {segment_count}] Score: {nws.score:.4f} | Source: {source_label} | {preview}")
-
-                    segment_header = f"[Knowledge Segment {segment_count}] Source: {source_label} | Score: {nws.score:.4f}"
-                    all_segments.append(f"{segment_header}\n{content}")
-                    segment_count += 1
+                segments, segment_count = build_segments_from_nodes(
+                    final_nodes,
+                    start_index=segment_count,
+                )
+                all_segments.extend(segments)
 
             except Exception as e:
                 logger.error(f"Error querying collection {kb_id}: {str(e)}")

@@ -39,25 +39,27 @@ class SearchKnowledgeTool(BaseTool):
             # 动态计算截断上限：完全绑定在 RAG_CHUNK_SIZE 与 RAG_DEFAULT_TOP_K 上，
             # 方便通过这两个参数统一控制上下文长度与性能。
             from core.settings import settings
-            dynamic_max_len = int(settings.RAG_CHUNK_SIZE * settings.RAG_DEFAULT_TOP_K)
+            from rag.postprocess.truncate import truncate_rag_result_token_aware
+
+            dynamic_max_tokens = int(settings.RAG_CHUNK_SIZE * settings.RAG_DEFAULT_TOP_K)
             dynamic_max_segments = settings.RAG_DEFAULT_TOP_K
-            
-            # 截断结果，防止超出模型上下文限制
-            truncated_context = truncate_rag_result(
-                context, 
-                max_length=dynamic_max_len, 
-                max_segments=dynamic_max_segments
+
+            # 基于 token 的截断，防止超出模型上下文限制
+            truncated_context, truncated = truncate_rag_result_token_aware(
+                context,
+                max_tokens=dynamic_max_tokens,
+                max_segments=dynamic_max_segments,
             )
-            
-            if len(truncated_context) < len(context):
+
+            if truncated:
                 logger.info(
-                    "RAG结果已截断: %d -> %d (Limit: %d chars, %d segments)",
+                    "RAG结果已截断（token-aware）: 原长度=%d, 新长度=%d, Limit: %d tokens, %d segments",
                     len(context),
                     len(truncated_context),
-                    dynamic_max_len,
+                    dynamic_max_tokens,
                     dynamic_max_segments,
                 )
-            
+
             return truncated_context
         except Exception as e:
             logger.error(f"Error in search_knowledge tool: {str(e)}")

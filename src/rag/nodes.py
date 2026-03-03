@@ -52,6 +52,10 @@ from utils.log_utils import get_logger
 
 logger = get_logger(__name__)
 
+# 默认的 RAG 检索工具名称（便于集中管理和覆写）
+DEFAULT_RAG_SEARCH_TOOL_NAME = "search_knowledge"
+DEFAULT_RAG_EVAL_TOOL_NAMES = [DEFAULT_RAG_SEARCH_TOOL_NAME]
+
 # 工具轮次达上限时，force_done 节点默认追加的系统提示（可被 create_force_done_node 的 message 覆盖）
 DEFAULT_FORCE_DONE_MESSAGE = "[系统] 本轮检索次数已达上限，请基于已获得的检索结果回答或重新提问。"
 
@@ -249,7 +253,8 @@ def create_rag_model_node(
     tools: List[BaseTool],
     system_prompt_fn: Callable[[List[str], str], str] = None,
     safety_check: bool = False,
-    max_tool_iterations: int = 5
+    max_tool_iterations: int = 5,
+    primary_search_tool_name: str = DEFAULT_RAG_SEARCH_TOOL_NAME,
 ):
     """
     创建通用的 RAG 模型调用节点
@@ -326,41 +331,43 @@ def create_rag_model_node(
         messages = [system_msg] + filtered_messages
 
         # 6.1 记录本次调用时的检索上下文情况，便于排查「RAG 失效」
-        # 查找最近一次 search_knowledge 工具返回的 ToolMessage（若有）
+        # 查找最近一次检索工具（如 search_knowledge）返回的 ToolMessage（若有）
         rag_tool_messages = [
             msg for msg in state.get("messages", [])
-            if isinstance(msg, ToolMessage) and getattr(msg, "name", "") == "search_knowledge"
+            if isinstance(msg, ToolMessage) and getattr(msg, "name", "") == primary_search_tool_name
         ]
         last_rag_msg: ToolMessage | None = rag_tool_messages[-1] if rag_tool_messages else None
         if last_rag_msg and isinstance(last_rag_msg.content, str):
             preview = last_rag_msg.content[:200].replace("\n", " ")
             logger.info(
-                "[rag_model_node] Context Check: tool_rounds=%s, kb_ids=%s, search_knowledge_len=%d",
+                "[rag_model_node] Context Check: tool_rounds=%s, kb_ids=%s, %s_len=%d",
                 tool_rounds,
                 kb_ids,
+                primary_search_tool_name,
                 len(last_rag_msg.content),
             )
         else:
             logger.info(
-                "[rag_model_node] Context Check: tool_rounds=%s, kb_ids=%s, no_search_knowledge_context",
+                "[rag_model_node] Context Check: tool_rounds=%s, kb_ids=%s, no_%s_context",
                 tool_rounds,
                 kb_ids,
+                primary_search_tool_name,
             )
         
         # 7. 调用模型
         response = await bound_model.ainvoke(messages, config)
 
         # 7.1 若当前轮已被 memory_vs_kb_router 判定为应启用 KB（kb_enabled=True），
-        # 且这是本轮第一次检索尝试（tool_rounds==0 且还没有 search_knowledge 结果），
-        # 但模型本次没有提出任何 tool_calls，则强制触发一次 search_knowledge 调用。
+        # 且这是本轮第一次检索尝试（tool_rounds==0 且还没有检索工具结果），
+        # 但模型本次没有提出任何 tool_calls，则强制触发一次 primary_search_tool_name 调用。
         #
         # 这样可以减少「明明是文档类问题却完全不走检索」的随机性，同时不改变图结构。
         kb_enabled = state.get("kb_enabled", True)
         if kb_enabled and tool_rounds == 0:
-            # 查找当前 state 中是否已经有 search_knowledge 的 ToolMessage（避免重复强制）
+            # 查找当前 state 中是否已经有检索工具的 ToolMessage（避免重复强制）
             existing_rag_msgs = [
                 msg for msg in state.get("messages", [])
-                if isinstance(msg, ToolMessage) and getattr(msg, "name", "") == "search_knowledge"
+                if isinstance(msg, ToolMessage) and getattr(msg, "name", "") == primary_search_tool_name
             ]
             no_existing_search = not existing_rag_msgs
 
@@ -375,13 +382,14 @@ def create_rag_model_node(
 
                 forced_tool_call = {
                     "id": f"auto_search_{uuid4()}",
-                    "name": "search_knowledge",
+                    "name": primary_search_tool_name,
                     "args": {"query": last_question},
                 }
 
                 logger.info(
                     "[rag_model_node] 未收到模型的 tool_calls，且 kb_enabled=True，"
-                    "自动触发一次 search_knowledge 工具调用。"
+                    "自动触发一次 %s 工具调用。",
+                    primary_search_tool_name,
                 )
 
                 # 用一个只包含 tool_calls 的 AIMessage 替代本次模型响应，
@@ -415,7 +423,7 @@ def create_rag_model_node(
 
 def create_rag_evaluator_node(
     model_name: Optional[str] = None,
-    tool_names: List[str] = ["search_knowledge"],
+    tool_names: Optional[List[str]] = None,
 ) -> Callable:
     """
     创建 RAG 评估节点：评估检索结果是否足以回答问题。
@@ -428,9 +436,10 @@ def create_rag_evaluator_node(
             return {"retrieval_eval": "not_found"}
 
         # 获取最后一次检索结果（从指定的工具列表中匹配）
+        effective_tool_names = tool_names or DEFAULT_RAG_EVAL_TOOL_NAMES
         tool_messages = [
             m for m in messages 
-            if isinstance(m, ToolMessage) and getattr(m, "name", "") in tool_names
+            if isinstance(m, ToolMessage) and getattr(m, "name", "") in effective_tool_names
         ]
         if not tool_messages:
             return {"retrieval_eval": "not_found"}
@@ -491,6 +500,9 @@ def create_rag_evaluator_node(
 
 def create_memory_vs_kb_router_node(
     model_name: Optional[str] = None,
+    doc_keywords_override: Optional[List[str]] = None,
+    personal_keywords_override: Optional[List[str]] = None,
+    system_prompt_override: Optional[str] = None,
 ) -> Callable:
     """
     创建一个「长期记忆 vs 知识库」路由节点。
@@ -526,8 +538,8 @@ def create_memory_vs_kb_router_node(
         # 仅作为粗粒度启发式，用于快速分类问题类型，避免每次都调 LLM：
         # - doc_keywords：更像“文档事实型问题”
         # - personal_keywords：更像“个人/会话型问题”
-        doc_keywords = ["合同", "文档", "资料", "附件", "论文", "报告", "条款", "作者", "标题"]
-        personal_keywords = ["我是谁", "我喜欢", "我爱吃", "我最近", "我的爱好", "我的兴趣"]
+        doc_keywords = doc_keywords_override or ["合同", "文档", "资料", "附件", "论文", "报告", "条款", "作者", "标题"]
+        personal_keywords = personal_keywords_override or ["我是谁", "我喜欢", "我爱吃", "我最近", "我的爱好", "我的兴趣"]
 
         if any(kw in q for kw in doc_keywords):
             logger.info("[memory_vs_kb_router] heuristic: doc-like question -> enable KB")
@@ -542,8 +554,9 @@ def create_memory_vs_kb_router_node(
         except Exception:
             eval_model = get_model(settings.DEFAULT_MODEL)
 
+        prompt = system_prompt_override or MEMORY_VS_KB_SYSTEM_PROMPT
         eval_input = [
-            SystemMessage(content=MEMORY_VS_KB_SYSTEM_PROMPT),
+            SystemMessage(content=prompt),
             HumanMessage(content=f"用户问题: {q}"),
         ]
 

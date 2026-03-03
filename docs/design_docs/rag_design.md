@@ -39,7 +39,9 @@ src/rag/
 ├── service.py         # RagService：摄入、混合检索、BM25 缓存、RRF
 ├── nodes.py           # create_rag_model_node、create_rag_system_prompt、语言检测
 ├── tools.py           # SearchKnowledgeTool（对外工具）
-├── embedding_batcher.py  # TokenAwareEmbedding、CacheAwareEmbedding（与 Memory 共用缓存）
+├── chunking/
+│   ├── core.py                  # 分块策略（简单分块 / 预留父子分块）
+│   └── embedding_batcher.py     # TokenAwareEmbedding、CacheAwareEmbedding（与 Memory 共用缓存）
 ├── utils.py           # truncate_rag_result、format_rag_fallback_response 等
 └── ...
 ```
@@ -73,7 +75,7 @@ src/rag/
 
 ### 3.3 与 Memory 的共用关系
 
-- **EmbeddingCache**：RAG 通过 `rag/embedding_batcher.CacheAwareEmbedding` 使用 `memory.embedding_cache.get_embedding_cache()`，与长期记忆共用同一缓存。
+- **EmbeddingCache**：RAG 通过 `rag.chunking.embedding_batcher.CacheAwareEmbedding` 使用 `memory.embedding_cache.get_embedding_cache()`，与长期记忆共用同一缓存。
 - **Embedding 模型**：均通过 `core.llm.get_embedding_model()` 获取，保证向量空间一致。
 - **Qdrant 连接**：RAG 使用独立 QdrantClient/AsyncQdrantClient（同一 host/port），按 collection_name=kb_id 存储；长期记忆使用独立 collection（如 agent_conversations），二者数据隔离。
 

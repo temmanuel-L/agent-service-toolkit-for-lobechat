@@ -257,19 +257,54 @@ async def kb_delete(request: Request):
         body = await request.json()
         kb_id = body.get("kb_id")
 
-        if not kb_id:
-            return {"status": "error", "message": "Missing kb_id"}
-
-        logger.info(f"Received KB delete request: kb_id={kb_id}")
+        logger.info(f"Received KB delete request: kb_id={kb_id}, full_body={body}")
         
+        if not kb_id:
+            logger.warning("KB delete request missing kb_id")
+            return {"status": "error", "message": "Missing kb_id"}
+        
+        logger.info(f"Calling rag_service.delete_knowledge_base for kb_id={kb_id}")
         success = await rag_service.delete_knowledge_base(kb_id)
+        
+        logger.info(f"Delete result for kb_id={kb_id}: success={success}")
         
         if success:
             return {"status": "success", "kb_id": kb_id}
         else:
             return {"status": "error", "message": f"Failed to delete KB or KB not found: {kb_id}"}
     except Exception as e:
-        logger.error(f"KB Delete API Error: {str(e)}")
+        logger.error(f"KB Delete API Error: {str(e)}", exc_info=True)
+        return {"status": "error", "message": str(e)}
+
+
+@router.post("/api/kb/file/delete")
+async def kb_file_delete(request: Request):
+    """
+    知识库文件删除接口
+    删除知识库中指定文件对应的 Qdrant points 和 PostgreSQL 元数据
+    """
+    try:
+        body = await request.json()
+        kb_id = body.get("kb_id")
+        file_name = body.get("file_name")
+
+        logger.info(f"Received KB file delete request: kb_id={kb_id}, file_name={file_name}, full_body={body}")
+        
+        if not kb_id or not file_name:
+            logger.warning(f"KB file delete request missing params: kb_id={kb_id}, file_name={file_name}")
+            return {"status": "error", "message": "Missing kb_id or file_name"}
+        
+        logger.info(f"Calling rag_service.delete_file_from_knowledge_base for kb_id={kb_id}, file_name={file_name}")
+        success = await rag_service.delete_file_from_knowledge_base(kb_id, file_name)
+        
+        logger.info(f"Delete file result for kb_id={kb_id}, file_name={file_name}: success={success}")
+        
+        if success:
+            return {"status": "success", "kb_id": kb_id, "file_name": file_name}
+        else:
+            return {"status": "error", "message": f"Failed to delete file: {file_name}"}
+    except Exception as e:
+        logger.error(f"KB File Delete API Error: {str(e)}", exc_info=True)
         return {"status": "error", "message": str(e)}
 
 

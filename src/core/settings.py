@@ -222,6 +222,21 @@ class Settings(BaseSettings):
     RAG_RERANK_TIME_LIMIT: float = 1.0     # Rerank 最长允许耗时（秒）。<=0 表示不限制（使用内部默认超时）
     RAG_RERANK_MIN_SCORE: float = 0.0      # Rerank 分数下限（默认不启用）。低于此阈值的片段会被剔除
 
+    # RAG Query 改写 / HyDE 配置
+    # - RAG_HYDE_ENABLED: 是否启用 HyDE 风格的 Query 改写（默认关闭，保持兼容）
+    # - RAG_HYDE_NUM_VARIANTS: 每次为同一个问题生成多少条改写/假想文档（建议 1–3）
+    RAG_HYDE_ENABLED: bool = False
+    RAG_HYDE_NUM_VARIANTS: int = 0
+
+    # RAG 检索过滤推断配置
+    # - RAG_QUERY_FILTER_INFERENCE_ENABLED: 是否尝试从自然语言问题中推断简单的过滤条件
+    #   （例如“某某论文的作者是谁” → 过滤 doc_title 包含“某某论文”）。默认关闭，保持兼容。
+    RAG_QUERY_FILTER_INFERENCE_ENABLED: bool = False
+
+    # RAG 分块策略配置
+    # - RAG_CHUNKING_STRATEGY: "simple" 或 "parent_child"（预留，目前实现 simple，parent_child 作为扩展点）
+    RAG_CHUNKING_STRATEGY: str = "simple"
+
     # DuckDuckGo 网页搜索（FormattedDuckDuckGoSearchResults）
     # 逻辑：每次调用 WebSearch(query) = 只发 1 次搜索请求；DDGS_TIMEOUT 限制这次调用的总耗时。
     # DDGS_TOP_K 是「这一次搜索」返回结果经 BM25/去重/过滤后最多保留几条，不是「搜几次」，不会 12*5 秒。

@@ -167,6 +167,13 @@ async def lifespan(app) -> AsyncGenerator[None, None]:
                 initialize_store(pool_max_size=_SHARED_POOL_SIZE)
             )
 
+            # 4a. 初始化知识库元数据表
+            from rag import kb_metadata
+            try:
+                await kb_metadata.init_kb_metadata_store()
+            except Exception as exc:
+                logger.warning(f"知识库元数据表初始化失败（可能 PG 未配置）: {exc}")
+
             # 5. 加载所有 agent → 绑定 saver / store
             for agent_info in get_all_agent_info():
                 await _load_and_bind_agent(agent_info.key, shared_saver, shared_store)
