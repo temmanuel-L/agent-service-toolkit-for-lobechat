@@ -87,7 +87,8 @@ class AWSModelName(StrEnum):
 class OllamaModelName(StrEnum):
     """https://ollama.com/search"""
 
-    OLLAMA_GENERIC = "alibayram/Qwen3-30B-A3B-Instruct-2507:latest"
+    # OLLAMA_GENERIC = "alibayram/Qwen3-30B-A3B-Instruct-2507:latest"
+    OLLAMA_GENERIC = "qwen3:30b-a3b-instruct-16k"
     # OLLAMA_GENERIC = "qwen3-coder-next:latest"
     # OLLAMA_GENERIC = "glm-4.7-flash"
 

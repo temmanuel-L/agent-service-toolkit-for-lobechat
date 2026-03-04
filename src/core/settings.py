@@ -207,14 +207,14 @@ class Settings(BaseSettings):
     # 说明：默认偏向「语义向量检索」，BM25 主要作为兜底补充标题/关键词命中。
     # 如果你的文档多为合同/规章这类结构化条款，建议适度减小分块尺寸，
     # 让每个 chunk 更接近「一条/几条条款」，有利于命中精确实体（如甲方/乙方名称）。
-    RAG_CHUNK_SIZE: int = 512           # 文档分块的目标大小（约 768 token，适中偏小）
-    RAG_CHUNK_OVERLAP: int = 64         # 相邻块重叠字符数，保持在 chunk_size 的约 10–15%
-    RAG_DEFAULT_TOP_K: int = 10          # 单次检索返回的最相关文本块数量（向量/混合检索最终截断条数）
+    RAG_CHUNK_SIZE: int = 512           # 文档分块的目标大小（token 级），适中偏小
+    RAG_CHUNK_OVERLAP: int = 64         # 相邻块重叠 token 数，保持在 chunk_size 的约 10–15%
+    RAG_DEFAULT_TOP_K: int = 8          # 单次检索返回的最相关文本块数量（向量/混合检索最终截断条数）
     RAG_HYBRID_SEARCH: bool = True      # 是否启用 BM25 + 向量的混合检索（关闭则仅向量检索）
     # 将 BM25 权重从 0.4 下调到 0.2，使排序更偏向语义向量结果，BM25 只做轻量辅助。
     RAG_BM25_WEIGHT: float = 0.2        # BM25 在 RRF 融合中的权重（0.0-1.0，越大越偏关键词匹配）
-    RAG_MIN_RELEVANCE_SCORE: float = 0.005  # 若最高 RRF 分低于此值则本库不返回片段（0=不启用）。知识库与问题域不符时可设约 0.008～0.01 减少无关结果
-    RAG_RERANK_ENABLED: bool = False      # 是否启用 Rerank（通过外部 API，不占宿主机算力）
+    RAG_MIN_RELEVANCE_SCORE: float = 0.008  # 若最高相关分低于此值则本库不返回片段（0=不启用），默认略微抑制弱相关结果
+    RAG_RERANK_ENABLED: bool = False      # 是否启用 Rerank（通过外部 API，不占宿主机算力），默认关闭，需在 .env 中显式开启
     RAG_RERANK_BASE_URL: str = ""         # Rerank 服务地址（如 TEI 或智谱），与 api_key 配合使用
     RAG_RERANK_API_KEY: SecretStr | None = None  # 可选，智谱等需鉴权时配置
     RAG_RERANK_MODEL: str = ""            # Rerank 模型名称（供 API 使用，若为空则启用时用默认）
@@ -226,7 +226,7 @@ class Settings(BaseSettings):
     # - RAG_HYDE_ENABLED: 是否启用 HyDE 风格的 Query 改写（默认关闭，保持兼容）
     # - RAG_HYDE_NUM_VARIANTS: 每次为同一个问题生成多少条改写/假想文档（建议 1–3）
     RAG_HYDE_ENABLED: bool = False
-    RAG_HYDE_NUM_VARIANTS: int = 0
+    RAG_HYDE_NUM_VARIANTS: int = 2
 
     # RAG 检索过滤推断配置
     # - RAG_QUERY_FILTER_INFERENCE_ENABLED: 是否尝试从自然语言问题中推断简单的过滤条件
@@ -234,8 +234,9 @@ class Settings(BaseSettings):
     RAG_QUERY_FILTER_INFERENCE_ENABLED: bool = False
 
     # RAG 分块策略配置
-    # - RAG_CHUNKING_STRATEGY: "simple" 或 "parent_child"（预留，目前实现 simple，parent_child 作为扩展点）
-    RAG_CHUNKING_STRATEGY: str = "simple"
+    # - RAG_CHUNKING_STRATEGY: "simple" 或 "parent_child"
+    #   默认使用 parent_child，并在检索阶段将叶子命中提升为父级上下文。
+    RAG_CHUNKING_STRATEGY: str = "parent_child"
 
     # DuckDuckGo 网页搜索（FormattedDuckDuckGoSearchResults）
     # 逻辑：每次调用 WebSearch(query) = 只发 1 次搜索请求；DDGS_TIMEOUT 限制这次调用的总耗时。

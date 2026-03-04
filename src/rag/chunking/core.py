@@ -3,13 +3,14 @@ RAG 分块（Chunking）核心工具。
 
 当前提供：
 - 基于 LlamaIndex SentenceSplitter 的固定窗口分块策略；
-- 通过 settings.RAG_CHUNKING_STRATEGY 预留父子分块等扩展点（目前仅 simple）。
+- 基于 HierarchicalNodeParser 的父子分块策略（叶子向量索引 + 父节点上下文）。
 """
 
 from __future__ import annotations
 
 import tiktoken
 from llama_index.core.node_parser import SentenceSplitter, HierarchicalNodeParser
+from llama_index.core.node_parser.relational.hierarchical import get_leaf_nodes
 
 from core.settings import settings
 
@@ -41,14 +42,12 @@ def build_chunking_transformations() -> list:
     strategy = (getattr(settings, "RAG_CHUNKING_STRATEGY", "simple") or "simple").lower()
 
     if strategy == "parent_child":
-        # 父子分块策略：使用 HierarchicalNodeParser 生成两层节点
+        # 父子分块策略：使用 HierarchicalNodeParser 生成两层节点。
         #
-        # 设计：
-        # - child 层：使用当前 RAG_CHUNK_SIZE 作为较小粒度，用于向量检索；
-        # - parent 层：使用 ~3x 的窗口作为较大粒度，用于提供更完整的上下文。
-        #
-        # HierarchicalNodeParser 会自动为 child 节点打上 parent 关联信息，
-        # 后续若需要可以在检索侧利用这些元数据做 parent 级别的上下文展开。
+        # 在「摄入阶段」我们会显式调用同样的配置，将 parent/child
+        # 全部写入 docstore，仅对 leaf nodes 建立向量索引。
+        # 这里保留返回 parser 的接口，便于未来在需要时直接用于
+        # LlamaIndex 的 transformations 管线（向后兼容）。
         base_size = settings.RAG_CHUNK_SIZE
         parent_size = max(base_size * 3, base_size + settings.RAG_CHUNK_OVERLAP)
         parser = HierarchicalNodeParser.from_defaults(
@@ -61,8 +60,29 @@ def build_chunking_transformations() -> list:
     return [splitter]
 
 
+def build_parent_child_nodes(documents: list) -> tuple[list, list]:
+    """
+    使用 HierarchicalNodeParser 将 Document 列表切分为父子两层节点。
+
+    返回:
+        (leaf_nodes, all_nodes)
+        - leaf_nodes: 叶子节点列表，仅这些节点会进入向量索引；
+        - all_nodes:  包含父子在内的所有节点，用于写入 docstore，
+                      便于检索阶段按 parent 展开上下文。
+    """
+    base_size = settings.RAG_CHUNK_SIZE
+    parent_size = max(base_size * 3, base_size + settings.RAG_CHUNK_OVERLAP)
+    parser = HierarchicalNodeParser.from_defaults(
+        chunk_sizes=[parent_size, base_size]
+    )
+    all_nodes = parser.get_nodes_from_documents(documents)
+    leaf_nodes = get_leaf_nodes(all_nodes)
+    return leaf_nodes, all_nodes
+
+
 __all__ = [
     "build_default_sentence_splitter",
     "build_chunking_transformations",
+    "build_parent_child_nodes",
 ]
 

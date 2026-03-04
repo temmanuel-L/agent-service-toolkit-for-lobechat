@@ -172,6 +172,14 @@ class RagService:
         self._bm25_cache: dict[str, tuple] = {}
         self._bm25_lock = threading.Lock()
 
+        # ---- 向量索引 / docstore 缓存（按知识库维度）----
+        # 说明：
+        # - simple 策略下可选地重用 VectorStoreIndex，减少每次查询的 index 构建开销；
+        # - parent_child 策略下，需要依赖 docstore 中的父子节点关系，
+        #   才能在检索阶段将叶子命中提升为父节点上下文。
+        # key=kb_id, value=VectorStoreIndex
+        self._vector_indexes: dict[str, VectorStoreIndex] = {}
+
     # ================================================================
     # URL 映射（Docker 内网）
     # ================================================================
@@ -398,8 +406,9 @@ class RagService:
             )
 
             # 5. 配置 Qdrant 向量存储与分块转换
-            # 注意：LlamaIndex 在写入（from_documents → add）阶段会调用同步 client.create_collection，
-            # 因此此处必须提供同步 QdrantClient；异步 AsyncQdrantClient 仅用于查询。
+            # 注意：LlamaIndex 在写入（from_documents / VectorStoreIndex(...)）阶段会调用
+            # 同步 client.create_collection，因此此处必须提供同步 QdrantClient；
+            # 异步 AsyncQdrantClient 仅用于查询。
             vector_store = QdrantVectorStore(
                 collection_name=collection_name,
                 client=self.client,
@@ -407,25 +416,48 @@ class RagService:
             )
             storage_context = StorageContext.from_defaults(vector_store=vector_store)
 
-            # 分块策略统一由 chunking 子模块管理，便于后续扩展父子分块等高级策略
-            from rag.chunking import build_chunking_transformations
+            from rag.chunking import (
+                build_chunking_transformations,
+                build_parent_child_nodes,
+            )
 
-            transformations = build_chunking_transformations()
+            strategy = (getattr(settings, "RAG_CHUNKING_STRATEGY", "simple") or "simple").lower()
             logger.info(
                 "使用分块策略: strategy=%s, chunk_size=%d, chunk_overlap=%d",
-                getattr(settings, "RAG_CHUNKING_STRATEGY", "simple"),
+                strategy,
                 settings.RAG_CHUNK_SIZE,
                 settings.RAG_CHUNK_OVERLAP,
             )
 
             # 6. 创建索引（解析 + 嵌入 + 写入）
-            VectorStoreIndex.from_documents(
-                documents,
-                storage_context=storage_context,
-                embed_model=self.embed_model,
-                transformations=transformations,
-                show_progress=False,  # 生产环境设为 False 以保持日志简洁
-            )
+            if strategy == "parent_child":
+                # 教科书级 parent-child：
+                # - 使用 HierarchicalNodeParser 生成父子两层节点；
+                # - 将所有节点写入 docstore，便于检索阶段通过父子关系展开上下文；
+                # - 仅对叶子节点建立向量索引，用于高精度语义检索。
+                leaf_nodes, all_nodes = build_parent_child_nodes(documents)
+                # 将父子节点全部注册到 docstore 中，保留完整层级关系
+                storage_context.docstore.add_documents(all_nodes)
+
+                index = VectorStoreIndex(
+                    nodes=leaf_nodes,
+                    storage_context=storage_context,
+                    embed_model=self.embed_model,
+                    show_progress=False,
+                )
+            else:
+                # simple 策略：沿用原有 SentenceSplitter 固定窗口分块行为
+                transformations = build_chunking_transformations()
+                index = VectorStoreIndex.from_documents(
+                    documents,
+                    storage_context=storage_context,
+                    embed_model=self.embed_model,
+                    transformations=transformations,
+                    show_progress=False,  # 生产环境设为 False 以保持日志简洁
+                )
+
+            # 缓存索引，便于检索阶段在 parent_child 模式下访问 docstore
+            self._vector_indexes[collection_name] = index
 
             # 7. 失效 BM25 缓存，下次查询时自动重建
             self.invalidate_bm25_cache(kb_id)
@@ -592,6 +624,7 @@ class RagService:
             return ""
 
         hybrid_enabled = settings.RAG_HYBRID_SEARCH
+        chunk_strategy = (getattr(settings, "RAG_CHUNKING_STRATEGY", "simple") or "simple").lower()
         mode_label = "hybrid(vector+BM25)" if hybrid_enabled else "vector-only"
         logger.info(
             f"知识库检索: query='{query_str[:50]}...', kb_ids={kb_ids}, "
@@ -642,125 +675,302 @@ class RagService:
 
                 t0 = time.perf_counter()
 
-                # ---- 构造向量存储 ----
-                vector_store = QdrantVectorStore(
-                    collection_name=kb_id,
-                    aclient=self.aclient,
-                    client=None,
-                )
-
-                # 第一阶段召回使用「放大的 top_k」
-                base_multiplier = 3
-                recall_top_k = similarity_top_k * base_multiplier
-                if _looks_like_english_title_query(effective_query):
-                    recall_top_k = max(recall_top_k, similarity_top_k * 6)
-                recall_top_k = min(recall_top_k, 80)
-
-                # ---- BM25 构造（可选）----
-                bm25 = None
-                corpus_size = 0
-                if hybrid_enabled:
-                    bm25, corpus_size = self._get_or_build_bm25(kb_id, recall_top_k)
-
-                # ---- 调用 search 子模块执行单库检索 ----
-                search_req = SearchRequest(
-                    query=effective_query,
-                    kb_ids=[kb_id],
-                    top_k=recall_top_k,
-                    filters=inferred_filters,
-                )
-
-                search_result = await hybrid_search_single_kb(
-                    search_req,
-                    kb_id=kb_id,
-                    vector_store=vector_store,
-                    embed_model=self.embed_model,
-                    bm25_retriever=bm25 if hybrid_enabled and bm25 is not None else None,
-                    corpus_size=corpus_size,
-                )
-
-                # 转换回 NodeWithScore 列表，后续沿用原有 rerank / 阈值 / 拼装逻辑
-                from llama_index.core.schema import TextNode
-
-                vector_nodes: list[NodeWithScore] = []
-                for hit in search_result.hits:
-                    node = TextNode(text=hit.text, metadata=hit.metadata)
-                    vector_nodes.append(NodeWithScore(node=node, score=hit.score))
-
-                vector_ms = (time.perf_counter() - t0) * 1000
-
-                # ---- Rerank 或启发式重排 ----
-                final_nodes = vector_nodes
-                if settings.RAG_RERANK_ENABLED:
-                    rerank_top_k = min(settings.RAG_RERANK_TOP_K, similarity_top_k)
-                    t_rerank = time.perf_counter()
-                    final_nodes = self._rerank_nodes(
-                        vector_nodes, query_str, top_k=rerank_top_k
-                    )
-                    rerank_ms = (time.perf_counter() - t_rerank) * 1000
-                    total_ms = (time.perf_counter() - t0) * 1000
-                    logger.info(
-                        "检索+Rerank: kb=%s, vector=%d(%.0fms), rerank=%d(%.0fms), total=%.0fms",
-                        kb_id,
-                        len(vector_nodes),
-                        vector_ms,
-                        len(final_nodes),
-                        rerank_ms,
-                        total_ms,
-                    )
-                else:
-                    # 启发式元数据/实体加权重排（Rerank 未启用时）
-                    q_lower = query_str.lower()
-                    boosted_nodes: list[NodeWithScore] = []
-                    for nws in vector_nodes:
-                        boost = 0.0
-                        meta = getattr(nws.node, "metadata", {}) or {}
-                        title = str(meta.get("doc_title", "")).lower()
-                        fname = str(meta.get("file_name", "")).lower()
-
-                        if title and len(q_lower) > 10 and q_lower in title:
-                            boost += 0.5 * nws.score
-                        if fname and len(q_lower) > 10 and q_lower.replace(" ", "") in fname.replace(" ", ""):
-                            boost += 0.3 * nws.score
-
-                        content_sample = (getattr(nws.node, "text", "") or "").strip()[:200]
-                        if any(kw in q_lower for kw in ["谁", "名称", "是谁", "叫什么", "哪家"]):
-                            if any(pattern in content_sample for pattern in ["甲方:", "甲方：", "乙方:", "乙方：", "委托方", "受托方", "（甲方）", "（乙方）"]):
-                                boost += 0.4 * nws.score
-
-                        boosted_nodes.append(NodeWithScore(
-                            node=nws.node,
-                            score=nws.score + boost,
-                        ))
-
-                    boosted_nodes.sort(key=lambda x: x.score, reverse=True)
-                    final_nodes = boosted_nodes[:similarity_top_k]
-                    total_ms = (time.perf_counter() - t0) * 1000
-                    logger.info(
-                        "检索(启发式重排): kb=%s, results=%d, total=%.0fms",
-                        kb_id,
-                        len(final_nodes),
-                        total_ms,
-                    )
-
-                # ---- 最低相关性阈值（可选）：知识库与问题域不符时避免返回无关片段 ----
-                min_score = getattr(settings, "RAG_MIN_RELEVANCE_SCORE", 0.0) or 0.0
-                if min_score > 0 and final_nodes:
-                    best = max(nws.score for nws in final_nodes)
-                    if best < min_score:
-                        logger.info(
-                            f"知识库 {kb_id} 最高相关分 {best:.4f} 低于阈值 {min_score}，跳过返回片段"
+                if chunk_strategy == "parent_child":
+                    # ---- parent_child：基于父子分块的检索，返回父节点上下文 ----
+                    # 1) 获取或构建向量索引（需包含 docstore，以保留父子关系）
+                    index = self._vector_indexes.get(kb_id)
+                    if index is None:
+                        # 回退：仅从向量存储构建索引（可能缺失父子关系信息）
+                        vector_store = QdrantVectorStore(
+                            collection_name=kb_id,
+                            aclient=self.aclient,
+                            client=None,
                         )
-                        continue
+                        index = VectorStoreIndex.from_vector_store(
+                            vector_store=vector_store,
+                            embed_model=self.embed_model,
+                        )
+                        self._vector_indexes[kb_id] = index
 
-                # ---- 格式化结果 ----
-                from rag.postprocess.segments import build_segments_from_nodes
+                    # 第一阶段召回使用「放大的 top_k」
+                    base_multiplier = 3
+                    recall_top_k = similarity_top_k * base_multiplier
+                    if _looks_like_english_title_query(effective_query):
+                        recall_top_k = max(recall_top_k, similarity_top_k * 6)
+                    recall_top_k = min(recall_top_k, 80)
 
-                segments, segment_count = build_segments_from_nodes(
-                    final_nodes,
-                    start_index=segment_count,
-                )
-                all_segments.extend(segments)
+                    # 2) 向量检索（叶子级别）
+                    retriever = index.as_retriever(similarity_top_k=recall_top_k)
+                    vector_nodes = await retriever.aretrieve(effective_query)
+
+                    # 3) 可选 BM25 检索（仍在叶子级别）
+                    bm25_nodes: list[NodeWithScore] | None = None
+                    if hybrid_enabled:
+                        bm25, corpus_size = self._get_or_build_bm25(kb_id, recall_top_k)
+                        if bm25 is not None and corpus_size > 0:
+                            bm25_nodes = bm25.retrieve(effective_query)
+
+                    # 4) 向量 + BM25 融合（叶子级别），保持与 simple 策略一致的加权 RRF 逻辑
+                    fused_nodes = vector_nodes
+                    if hybrid_enabled and bm25_nodes is not None:
+                        bm25_weight = settings.RAG_BM25_WEIGHT
+                        fused_nodes = reciprocal_rank_fusion(
+                            vector_nodes,
+                            bm25_nodes,
+                            recall_top_k,
+                            bm25_weight=bm25_weight,
+                        )
+                        fused_nodes = fused_nodes[:similarity_top_k]
+                    else:
+                        fused_nodes = vector_nodes[:similarity_top_k]
+
+                    vector_ms = (time.perf_counter() - t0) * 1000
+
+                    # 5) Rerank 或启发式重排（仍在叶子级别）
+                    final_leaf_nodes = fused_nodes
+                    if settings.RAG_RERANK_ENABLED:
+                        rerank_top_k = min(settings.RAG_RERANK_TOP_K, similarity_top_k)
+                        t_rerank = time.perf_counter()
+                        final_leaf_nodes = self._rerank_nodes(
+                            fused_nodes, query_str, top_k=rerank_top_k
+                        )
+                        rerank_ms = (time.perf_counter() - t_rerank) * 1000
+                        total_ms = (time.perf_counter() - t0) * 1000
+                        logger.info(
+                            "检索+Rerank(parent_child): kb=%s, vector=%d(%.0fms), rerank=%d(%.0fms), total=%.0fms",
+                            kb_id,
+                            len(fused_nodes),
+                            vector_ms,
+                            len(final_leaf_nodes),
+                            rerank_ms,
+                            total_ms,
+                        )
+                    else:
+                        # 启发式元数据/实体加权重排（Rerank 未启用时）
+                        q_lower = query_str.lower()
+                        boosted_nodes: list[NodeWithScore] = []
+                        for nws in fused_nodes:
+                            boost = 0.0
+                            meta = getattr(nws.node, "metadata", {}) or {}
+                            title = str(meta.get("doc_title", "")).lower()
+                            fname = str(meta.get("file_name", "")).lower()
+
+                            if title and len(q_lower) > 10 and q_lower in title:
+                                boost += 0.5 * nws.score
+                            if fname and len(q_lower) > 10 and q_lower.replace(" ", "") in fname.replace(" ", ""):
+                                boost += 0.3 * nws.score
+
+                            content_sample = (getattr(nws.node, "text", "") or "").strip()[:200]
+                            if any(kw in q_lower for kw in ["谁", "名称", "是谁", "叫什么", "哪家"]):
+                                if any(pattern in content_sample for pattern in ["甲方:", "甲方：", "乙方:", "乙方：", "委托方", "受托方", "（甲方）", "（乙方）"]):
+                                    boost += 0.4 * nws.score
+
+                            boosted_nodes.append(NodeWithScore(
+                                node=nws.node,
+                                score=nws.score + boost,
+                            ))
+
+                        boosted_nodes.sort(key=lambda x: x.score, reverse=True)
+                        final_leaf_nodes = boosted_nodes[:similarity_top_k]
+                        total_ms = (time.perf_counter() - t0) * 1000
+                        logger.info(
+                            "检索(启发式重排, parent_child): kb=%s, results=%d, total=%.0fms",
+                            kb_id,
+                            len(final_leaf_nodes),
+                            total_ms,
+                        )
+
+                    # 6) 依据最低相关性阈值过滤
+                    min_score = getattr(settings, "RAG_MIN_RELEVANCE_SCORE", 0.0) or 0.0
+                    if min_score > 0 and final_leaf_nodes:
+                        best = max(nws.score for nws in final_leaf_nodes)
+                        if best < min_score:
+                            logger.info(
+                                f"知识库 {kb_id} 最高相关分 {best:.4f} 低于阈值 {min_score}，跳过返回片段"
+                            )
+                            continue
+
+                    # 7) 将叶子命中提升为父节点上下文
+                    try:
+                        from llama_index.core.schema import NodeRelationship
+                    except Exception:
+                        NodeRelationship = None  # type: ignore
+
+                    parent_nodes_map: dict[str, NodeWithScore] = {}
+                    docstore = getattr(index, "storage_context", None)
+                    docstore = getattr(docstore, "docstore", None)
+
+                    for nws in final_leaf_nodes:
+                        node = nws.node
+                        parent_id = None
+                        parent_node = None
+
+                        if NodeRelationship is not None and docstore is not None:
+                            # 不同版本的 LlamaIndex 中 relationships 结构略有差异：
+                            # - 有的返回单个 RelatedNodeInfo
+                            # - 有的返回 RelatedNodeInfo 列表
+                            rels = getattr(node, "relationships", {}) or {}
+                            parent_rel = rels.get(NodeRelationship.PARENT) if rels else None
+                            if parent_rel:
+                                # 如果是列表，取第一个；否则直接使用对象本身
+                                if isinstance(parent_rel, list):
+                                    parent_rel = parent_rel[0] if parent_rel else None
+                                candidate_id = getattr(parent_rel, "node_id", None)
+                                if candidate_id:
+                                    try:
+                                        parent_node = docstore.get_node(candidate_id)
+                                        parent_id = candidate_id
+                                    except Exception:
+                                        parent_node = None
+
+                        if parent_node is None:
+                            # 找不到父节点时退化为使用自身
+                            parent_node = node
+                            parent_id = getattr(node, "node_id", None) or str(id(node))
+
+                        existing = parent_nodes_map.get(parent_id)
+                        score = float(nws.score or 0.0)
+                        if existing is None or score > existing.score:
+                            parent_nodes_map[parent_id] = NodeWithScore(
+                                node=parent_node,
+                                score=score,
+                            )
+
+                    parent_nodes = sorted(
+                        parent_nodes_map.values(),
+                        key=lambda x: x.score,
+                        reverse=True,
+                    )
+
+                    # 8) 格式化结果（此时每个节点已经是父级上下文）
+                    from rag.postprocess.segments import build_segments_from_nodes
+
+                    segments, segment_count = build_segments_from_nodes(
+                        parent_nodes,
+                        start_index=segment_count,
+                    )
+                    all_segments.extend(segments)
+                else:
+                    # ---- simple：沿用原有单层分块 + hybrid_search_single_kb 逻辑 ----
+                    # 构造向量存储
+                    vector_store = QdrantVectorStore(
+                        collection_name=kb_id,
+                        aclient=self.aclient,
+                        client=None,
+                    )
+
+                    # 第一阶段召回使用「放大的 top_k」
+                    base_multiplier = 3
+                    recall_top_k = similarity_top_k * base_multiplier
+                    if _looks_like_english_title_query(effective_query):
+                        recall_top_k = max(recall_top_k, similarity_top_k * 6)
+                    recall_top_k = min(recall_top_k, 80)
+
+                    # ---- BM25 构造（可选）----
+                    bm25 = None
+                    corpus_size = 0
+                    if hybrid_enabled:
+                        bm25, corpus_size = self._get_or_build_bm25(kb_id, recall_top_k)
+
+                    # ---- 调用 search 子模块执行单库检索 ----
+                    search_req = SearchRequest(
+                        query=effective_query,
+                        kb_ids=[kb_id],
+                        top_k=recall_top_k,
+                        filters=inferred_filters,
+                    )
+
+                    search_result = await hybrid_search_single_kb(
+                        search_req,
+                        kb_id=kb_id,
+                        vector_store=vector_store,
+                        embed_model=self.embed_model,
+                        bm25_retriever=bm25 if hybrid_enabled and bm25 is not None else None,
+                        corpus_size=corpus_size,
+                    )
+
+                    # 转换回 NodeWithScore 列表，后续沿用原有 rerank / 阈值 / 拼装逻辑
+                    from llama_index.core.schema import TextNode
+
+                    vector_nodes: list[NodeWithScore] = []
+                    for hit in search_result.hits:
+                        node = TextNode(text=hit.text, metadata=hit.metadata)
+                        vector_nodes.append(NodeWithScore(node=node, score=hit.score))
+
+                    vector_ms = (time.perf_counter() - t0) * 1000
+
+                    # ---- Rerank 或启发式重排 ----
+                    final_nodes = vector_nodes
+                    if settings.RAG_RERANK_ENABLED:
+                        rerank_top_k = min(settings.RAG_RERANK_TOP_K, similarity_top_k)
+                        t_rerank = time.perf_counter()
+                        final_nodes = self._rerank_nodes(
+                            vector_nodes, query_str, top_k=rerank_top_k
+                        )
+                        rerank_ms = (time.perf_counter() - t_rerank) * 1000
+                        total_ms = (time.perf_counter() - t0) * 1000
+                        logger.info(
+                            "检索+Rerank: kb=%s, vector=%d(%.0fms), rerank=%d(%.0fms), total=%.0fms",
+                            kb_id,
+                            len(vector_nodes),
+                            vector_ms,
+                            len(final_nodes),
+                            rerank_ms,
+                            total_ms,
+                        )
+                    else:
+                        # 启发式元数据/实体加权重排（Rerank 未启用时）
+                        q_lower = query_str.lower()
+                        boosted_nodes: list[NodeWithScore] = []
+                        for nws in vector_nodes:
+                            boost = 0.0
+                            meta = getattr(nws.node, "metadata", {}) or {}
+                            title = str(meta.get("doc_title", "")).lower()
+                            fname = str(meta.get("file_name", "")).lower()
+
+                            if title and len(q_lower) > 10 and q_lower in title:
+                                boost += 0.5 * nws.score
+                            if fname and len(q_lower) > 10 and q_lower.replace(" ", "") in fname.replace(" ", ""):
+                                boost += 0.3 * nws.score
+
+                            content_sample = (getattr(nws.node, "text", "") or "").strip()[:200]
+                            if any(kw in q_lower for kw in ["谁", "名称", "是谁", "叫什么", "哪家"]):
+                                if any(pattern in content_sample for pattern in ["甲方:", "甲方：", "乙方:", "乙方：", "委托方", "受托方", "（甲方）", "（乙方）"]):
+                                    boost += 0.4 * nws.score
+
+                            boosted_nodes.append(NodeWithScore(
+                                node=nws.node,
+                                score=nws.score + boost,
+                            ))
+
+                        boosted_nodes.sort(key=lambda x: x.score, reverse=True)
+                        final_nodes = boosted_nodes[:similarity_top_k]
+                        total_ms = (time.perf_counter() - t0) * 1000
+                        logger.info(
+                            "检索(启发式重排): kb=%s, results=%d, total=%.0fms",
+                            kb_id,
+                            len(final_nodes),
+                            total_ms,
+                        )
+
+                    # ---- 最低相关性阈值（可选）：知识库与问题域不符时避免返回无关片段 ----
+                    min_score = getattr(settings, "RAG_MIN_RELEVANCE_SCORE", 0.0) or 0.0
+                    if min_score > 0 and final_nodes:
+                        best = max(nws.score for nws in final_nodes)
+                        if best < min_score:
+                            logger.info(
+                                f"知识库 {kb_id} 最高相关分 {best:.4f} 低于阈值 {min_score}，跳过返回片段"
+                            )
+                            continue
+
+                    # ---- 格式化结果 ----
+                    from rag.postprocess.segments import build_segments_from_nodes
+
+                    segments, segment_count = build_segments_from_nodes(
+                        final_nodes,
+                        start_index=segment_count,
+                    )
+                    all_segments.extend(segments)
 
             except Exception as e:
                 logger.error(f"Error querying collection {kb_id}: {str(e)}")
