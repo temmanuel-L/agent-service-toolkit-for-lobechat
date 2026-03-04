@@ -236,7 +236,12 @@ class Settings(BaseSettings):
     # RAG 分块策略配置
     # - RAG_CHUNKING_STRATEGY: "simple" 或 "parent_child"
     #   默认使用 parent_child，并在检索阶段将叶子命中提升为父级上下文。
+    # - RAG_CHUNKING_TITLE_AWARE: 是否在上述策略基础上启用「标题感知」预分段：
+    #   - simple + True       → 先按标题切 section，再做 SentenceSplitter 分块；
+    #   - parent_child + True → 先按标题切 section，再做 HierarchicalNodeParser 父子分块；
+    #   - 设为 False 时则退化为纯长度/层级驱动的分块行为。
     RAG_CHUNKING_STRATEGY: str = "parent_child"
+    RAG_CHUNKING_TITLE_AWARE: bool = False
 
     # DuckDuckGo 网页搜索（FormattedDuckDuckGoSearchResults）
     # 逻辑：每次调用 WebSearch(query) = 只发 1 次搜索请求；DDGS_TIMEOUT 限制这次调用的总耗时。
