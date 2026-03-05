@@ -209,11 +209,26 @@ class Settings(BaseSettings):
     # 让每个 chunk 更接近「一条/几条条款」，有利于命中精确实体（如甲方/乙方名称）。
     RAG_CHUNK_SIZE: int = 512           # 文档分块的目标大小（token 级），适中偏小
     RAG_CHUNK_OVERLAP: int = 64         # 相邻块重叠 token 数，保持在 chunk_size 的约 10–15%
+    RAG_SPLITTER_TYPE: str = "token"    # 分块器类型: "token" 或 "sentence"
+    RAG_FATHER_SON_RATIO: int = 3       # parent_child 模式下父块/子块倍率（父块≈子块*倍率）
+    # parent_child 检索时，每个返回父段落的最大 token（0=自动按 chunk_size*father_son_ratio 推导）
+    # 目的：避免个别超长父块导致上下文预算被单段吞噬。
+    RAG_PARENT_MAX_TOKENS_PER_SEGMENT: int = 0
+    RAG_PARENT_STORE_SELF_HEAL_ENABLED: bool = True   # 启动时若 parent 映射缺失，是否自动尝试自愈重建
+    RAG_PARENT_STORE_SELF_HEAL_MAX_POINTS: int = 50000  # 自愈扫描单个KB的最大 points 数（防止超大库启动过慢）
     RAG_DEFAULT_TOP_K: int = 8          # 单次检索返回的最相关文本块数量（向量/混合检索最终截断条数）
     RAG_HYBRID_SEARCH: bool = True      # 是否启用 BM25 + 向量的混合检索（关闭则仅向量检索）
-    # 将 BM25 权重从 0.4 下调到 0.2，使排序更偏向语义向量结果，BM25 只做轻量辅助。
-    RAG_BM25_WEIGHT: float = 0.2        # BM25 在 RRF 融合中的权重（0.0-1.0，越大越偏关键词匹配）
+    # BM25 权重适当上调至 0.35：关键词信号更强，对"春节值班"/"专利条款"等精确查询，
+    # BM25 能有效将正确来源文档的得分与无关文档拉开差距，从而让 source 级过滤更准确。
+    RAG_BM25_WEIGHT: float = 0.35       # BM25 在 RRF 融合中的权重（0.0-1.0，越大越偏关键词匹配）
     RAG_MIN_RELEVANCE_SCORE: float = 0.008  # 若最高相关分低于此值则本库不返回片段（0=不启用），默认略微抑制弱相关结果
+    # 来源级别相对过滤：按来源文档分组，只保留最高分 >= 最佳来源分 * ratio 的整个来源。
+    # 与 segment 级过滤的本质区别：要么保留该来源的全部段落，要么整体排除，避免随机截断相关片段。
+    # 适用场景：一个查询针对某份合同，该合同段落得分整体高于其他文档时，
+    #           其他文档会被整体过滤，LLM 不再产生答非所问；
+    #           若多文档得分相近（合理的跨文档查询），则都保留。
+    # 值 0.65 = 允许最高分 ±35% 以内的来源共存；0 = 关闭此过滤。
+    RAG_SOURCE_SCORE_RATIO: float = 0.65
     RAG_RERANK_ENABLED: bool = False      # 是否启用 Rerank（通过外部 API，不占宿主机算力），默认关闭，需在 .env 中显式开启
     RAG_RERANK_BASE_URL: str = ""         # Rerank 服务地址（如 TEI 或智谱），与 api_key 配合使用
     RAG_RERANK_API_KEY: SecretStr | None = None  # 可选，智谱等需鉴权时配置

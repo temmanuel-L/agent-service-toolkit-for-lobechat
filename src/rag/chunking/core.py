@@ -12,42 +12,82 @@ from __future__ import annotations
 import re
 
 import tiktoken
-from llama_index.core.node_parser import SentenceSplitter, HierarchicalNodeParser
+from llama_index.core.node_parser import TokenTextSplitter, SentenceSplitter, HierarchicalNodeParser
 from llama_index.core.node_parser.relational.hierarchical import get_leaf_nodes
 from llama_index.core.schema import Document
 
 from core.settings import settings
 
 
+def _resolve_parent_size(base_size: int) -> int:
+    ratio = max(1, int(getattr(settings, "RAG_FATHER_SON_RATIO", 3) or 3))
+    return max(base_size * ratio, base_size + settings.RAG_CHUNK_OVERLAP)
+
+
 def _build_sentence_splitter(
     chunk_size: int,
-    chunk_overlap: int | None = None,
+    chunk_overlap: int,
+    encoding,
 ) -> SentenceSplitter:
-    """
-    内部工具：根据给定的 chunk_size/overlap 构建 SentenceSplitter。
-    """
-    if chunk_overlap is None:
-        chunk_overlap = settings.RAG_CHUNK_OVERLAP
-    encoding = tiktoken.get_encoding("cl100k_base")
-    splitter = SentenceSplitter(
+    return SentenceSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
         tokenizer=encoding.encode,
     )
+
+
+def _build_token_splitter(
+    chunk_size: int,
+    chunk_overlap: int | None = None,
+) -> TokenTextSplitter:
+    """
+    内部工具：根据给定的 chunk_size/overlap 构建 TokenTextSplitter。
+
+    说明：
+    - TokenTextSplitter 仍是“最大长度约束”，最后一个块可能小于 chunk_size；
+    - 相比 SentenceSplitter（句子优先），TokenTextSplitter 更接近固定 token 窗口。
+    """
+    if chunk_overlap is None:
+        chunk_overlap = settings.RAG_CHUNK_OVERLAP
+    encoding = tiktoken.get_encoding("cl100k_base")
+    splitter = TokenTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        tokenizer=encoding.encode,
+        backup_separators=["\n", " "],
+    )
     return splitter
 
 
-def build_default_sentence_splitter() -> SentenceSplitter:
+def _build_splitter(
+    chunk_size: int,
+    chunk_overlap: int | None = None,
+):
+    if chunk_overlap is None:
+        chunk_overlap = settings.RAG_CHUNK_OVERLAP
+    encoding = tiktoken.get_encoding("cl100k_base")
+    splitter_type = (getattr(settings, "RAG_SPLITTER_TYPE", "token") or "token").lower()
+    if splitter_type == "sentence":
+        return _build_sentence_splitter(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            encoding=encoding,
+        )
+    return _build_token_splitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+    )
+
+
+def build_default_sentence_splitter():
     """
-    基于当前 settings 构建一个默认的 SentenceSplitter。
+    基于当前 settings 构建默认分块器（token/sentence）。
 
     - 使用 cl100k_base 的 tiktoken 编码做 token 级分块；
-    - chunk_size / chunk_overlap 来自 RAG_CHUNK_SIZE / RAG_CHUNK_OVERLAP。
+    - chunk_size / chunk_overlap 来自 RAG_CHUNK_SIZE / RAG_CHUNK_OVERLAP；
+    - 分块器类型由 RAG_SPLITTER_TYPE 控制（token / sentence）。
     """
-    return _build_sentence_splitter(
-        chunk_size=settings.RAG_CHUNK_SIZE,
-        chunk_overlap=settings.RAG_CHUNK_OVERLAP,
-    )
+    return _build_splitter(chunk_size=settings.RAG_CHUNK_SIZE)
 
 
 def build_chunking_transformations() -> list:
@@ -55,7 +95,7 @@ def build_chunking_transformations() -> list:
     根据 RAG_CHUNKING_STRATEGY 返回用于 LlamaIndex 的 transformations 列表。
 
     当前支持：
-    - "simple": 仅使用 SentenceSplitter 做固定窗口分块（默认）；
+    - "simple": 仅使用 TokenTextSplitter 做固定窗口分块（默认）；
     - "parent_child": 使用 HierarchicalNodeParser 做父子分块（大块作为 parent，小块作为 child）。
 
     注意：更高级的「标题感知」分块在 build_title_aware_nodes 中实现，
@@ -65,9 +105,16 @@ def build_chunking_transformations() -> list:
 
     if strategy == "parent_child":
         base_size = settings.RAG_CHUNK_SIZE
-        parent_size = max(base_size * 3, base_size + settings.RAG_CHUNK_OVERLAP)
+        parent_size = _resolve_parent_size(base_size)
+        parser_ids = ["pc_parent", "pc_child"]
+        parser_map = {
+            parser_ids[0]: _build_splitter(parent_size, settings.RAG_CHUNK_OVERLAP),
+            parser_ids[1]: _build_splitter(base_size, settings.RAG_CHUNK_OVERLAP),
+        }
         parser = HierarchicalNodeParser.from_defaults(
-            chunk_sizes=[parent_size, base_size]
+            node_parser_ids=parser_ids,
+            node_parser_map=parser_map,
+            chunk_overlap=settings.RAG_CHUNK_OVERLAP,
         )
         return [parser]
 
@@ -101,9 +148,16 @@ def build_parent_child_nodes(
         expanded_docs = list(documents)
 
     base_size = settings.RAG_CHUNK_SIZE
-    parent_size = max(base_size * 3, base_size + settings.RAG_CHUNK_OVERLAP)
+    parent_size = _resolve_parent_size(base_size)
+    parser_ids = ["pc_parent", "pc_child"]
+    parser_map = {
+        parser_ids[0]: _build_splitter(parent_size, settings.RAG_CHUNK_OVERLAP),
+        parser_ids[1]: _build_splitter(base_size, settings.RAG_CHUNK_OVERLAP),
+    }
     parser = HierarchicalNodeParser.from_defaults(
-        chunk_sizes=[parent_size, base_size]
+        node_parser_ids=parser_ids,
+        node_parser_map=parser_map,
+        chunk_overlap=settings.RAG_CHUNK_OVERLAP,
     )
     all_nodes = parser.get_nodes_from_documents(expanded_docs)
     leaf_nodes = get_leaf_nodes(all_nodes)
@@ -235,7 +289,7 @@ def build_title_aware_nodes(
     if chunk_size is None:
         splitter = build_default_sentence_splitter()
     else:
-        splitter = _build_sentence_splitter(
+        splitter = _build_splitter(
             chunk_size=chunk_size,
             chunk_overlap=settings.RAG_CHUNK_OVERLAP,
         )
@@ -250,9 +304,29 @@ def build_title_aware_nodes(
     return nodes
 
 
+def build_simple_nodes(
+    documents: list,
+    *,
+    title_aware: bool | None = None,
+) -> list:
+    """
+    simple 策略统一分块入口（token 优先）。
+
+    - title_aware=False: 直接按 token 窗口分块；
+    - title_aware=True : 先按标题切 section，再按 token 窗口分块。
+    """
+    if title_aware is None:
+        title_aware = getattr(settings, "RAG_CHUNKING_TITLE_AWARE", False)
+    if title_aware:
+        return build_title_aware_nodes(documents, chunk_size=settings.RAG_CHUNK_SIZE)
+    splitter = build_default_sentence_splitter()
+    return splitter.get_nodes_from_documents(documents)
+
+
 __all__ = [
     "build_default_sentence_splitter",
     "build_chunking_transformations",
     "build_parent_child_nodes",
     "build_title_aware_nodes",
+    "build_simple_nodes",
 ]

@@ -3,7 +3,7 @@ from langchain_core.tools import BaseTool
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 from rag.service import rag_service
-from rag.utils import truncate_rag_result
+from rag.utils import RAG_SEGMENT_SEPARATOR
 from utils.log_utils import get_logger
 
 logger = get_logger(__name__)
@@ -40,9 +40,26 @@ class SearchKnowledgeTool(BaseTool):
             # 方便通过这两个参数统一控制上下文长度与性能。
             from core.settings import settings
             from rag.postprocess.truncate import truncate_rag_result_token_aware
+            import tiktoken
 
-            dynamic_max_tokens = int(settings.RAG_CHUNK_SIZE * settings.RAG_DEFAULT_TOP_K)
+            strategy = (getattr(settings, "RAG_CHUNKING_STRATEGY", "simple") or "simple").lower()
+            father_son_ratio = max(1, int(getattr(settings, "RAG_FATHER_SON_RATIO", 3) or 3))
+            token_budget_multiplier = father_son_ratio if strategy == "parent_child" else 1
+            dynamic_max_tokens = int(
+                settings.RAG_CHUNK_SIZE * settings.RAG_DEFAULT_TOP_K * token_budget_multiplier
+            )
             dynamic_max_segments = settings.RAG_DEFAULT_TOP_K
+            logger.info(
+                "RAG运行时配置: strategy=%s, splitter_type=%s, chunk_size=%d, chunk_overlap=%d, father_son_ratio=%d, top_k=%d, truncate_max_tokens=%d, truncate_max_segments=%d",
+                strategy,
+                (getattr(settings, "RAG_SPLITTER_TYPE", "token") or "token").lower(),
+                settings.RAG_CHUNK_SIZE,
+                settings.RAG_CHUNK_OVERLAP,
+                father_son_ratio,
+                settings.RAG_DEFAULT_TOP_K,
+                dynamic_max_tokens,
+                dynamic_max_segments,
+            )
 
             # 基于 token 的截断，防止超出模型上下文限制
             truncated_context, truncated = truncate_rag_result_token_aware(
@@ -59,6 +76,23 @@ class SearchKnowledgeTool(BaseTool):
                     dynamic_max_tokens,
                     dynamic_max_segments,
                 )
+            try:
+                segments = [s for s in truncated_context.split(RAG_SEGMENT_SEPARATOR) if s.strip()]
+                encoding = tiktoken.get_encoding("cl100k_base")
+                token_counts = sorted(len(encoding.encode(seg)) for seg in segments)
+                if token_counts:
+                    p50 = token_counts[len(token_counts) // 2]
+                    p90 = token_counts[max(0, int(len(token_counts) * 0.9) - 1)]
+                    logger.info(
+                        "RAG分段token统计: segments=%d, total_tokens=%d, p50=%d, p90=%d, max=%d",
+                        len(token_counts),
+                        sum(token_counts),
+                        p50,
+                        p90,
+                        token_counts[-1],
+                    )
+            except Exception as token_err:
+                logger.warning("RAG分段token统计失败（不影响主流程）: %s", token_err)
 
             return truncated_context
         except Exception as e:

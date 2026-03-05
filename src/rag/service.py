@@ -16,21 +16,23 @@ RAG (Retrieval-Augmented Generation) 服务模块
 """
 import os
 import re
+import asyncio
 import time
+import json
 import httpx
 import tempfile
 import threading
 import tiktoken
 import logging
 from typing import Optional, List, Any
+from pathlib import Path
 
 # 屏蔽第三方库冗长的调试日志
 logging.getLogger("llama_index").setLevel(logging.WARNING)
 logging.getLogger("bm25s").setLevel(logging.WARNING)
 
 from llama_index.core import VectorStoreIndex, StorageContext
-from llama_index.core.node_parser import SentenceSplitter
-from llama_index.core.schema import TextNode, NodeWithScore, QueryBundle
+from llama_index.core.schema import TextNode, NodeWithScore, QueryBundle, NodeRelationship
 from llama_index.retrievers.bm25 import BM25Retriever
 from llama_index.vector_stores.qdrant import QdrantVectorStore
 from llama_index.embeddings.langchain import LangchainEmbedding
@@ -211,6 +213,428 @@ class RagService:
         #   才能在检索阶段将叶子命中提升为父节点上下文。
         # key=kb_id, value=VectorStoreIndex
         self._vector_indexes: dict[str, VectorStoreIndex] = {}
+        # ---- parent 文本持久化缓存（用于 parent_child 在重启后恢复父上下文）----
+        self._parent_text_cache: dict[str, dict[str, str]] = {}
+        self._parent_store_dir = Path("data/rag_parent_store").absolute()
+        self._parent_store_dir.mkdir(parents=True, exist_ok=True)
+
+    def _parent_store_path(self, kb_id: str) -> Path:
+        safe_kb = re.sub(r"[^a-zA-Z0-9_.-]", "_", kb_id)
+        return self._parent_store_dir / f"{safe_kb}.json"
+
+    def _parent_store_key(self, kb_id: str) -> str:
+        return re.sub(r"[^a-zA-Z0-9_.-]", "_", kb_id)
+
+    def _save_parent_text_map(self, kb_id: str, parent_text_map: dict[str, str]) -> None:
+        try:
+            existing = self._load_parent_text_map(kb_id)
+            merged = dict(existing)
+            merged.update(parent_text_map)
+            self._parent_text_cache[kb_id] = merged
+            path = self._parent_store_path(kb_id)
+            path.write_text(
+                json.dumps(merged, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            logger.info(
+                "parent文本映射已持久化: kb=%s, parents=%d, file=%s",
+                kb_id,
+                len(merged),
+                str(path),
+            )
+        except Exception as e:
+            logger.warning("parent文本映射持久化失败（不影响主流程）: kb=%s, err=%s", kb_id, e)
+
+    def _load_parent_text_map(self, kb_id: str) -> dict[str, str]:
+        cached = self._parent_text_cache.get(kb_id)
+        if cached is not None:
+            return cached
+        path = self._parent_store_path(kb_id)
+        if not path.exists():
+            self._parent_text_cache[kb_id] = {}
+            return {}
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                parent_map = {
+                    str(k): str(v)
+                    for k, v in loaded.items()
+                    if str(k).strip() and str(v).strip()
+                }
+                self._parent_text_cache[kb_id] = parent_map
+                return parent_map
+        except Exception as e:
+            logger.warning("parent文本映射读取失败（降级为空）: kb=%s, err=%s", kb_id, e)
+        self._parent_text_cache[kb_id] = {}
+        return {}
+
+    def _clear_parent_text_map(self, kb_id: str) -> None:
+        self._parent_text_cache.pop(kb_id, None)
+        path = self._parent_store_path(kb_id)
+        try:
+            if path.exists():
+                path.unlink()
+                logger.info("parent文本映射已删除: kb=%s, file=%s", kb_id, str(path))
+        except Exception as e:
+            logger.warning("删除parent文本映射失败（不影响主流程）: kb=%s, err=%s", kb_id, e)
+
+    @staticmethod
+    def _extract_metadata_from_payload(payload: dict) -> dict:
+        if not payload:
+            return {}
+        if "metadata" in payload and isinstance(payload.get("metadata"), dict):
+            return payload.get("metadata") or {}
+        if "_node_content" in payload:
+            try:
+                nc = json.loads(payload["_node_content"])
+                metadata = nc.get("metadata", {}) or {}
+                if isinstance(metadata, dict):
+                    return metadata
+            except (json.JSONDecodeError, TypeError):
+                return {}
+        return {}
+
+    @staticmethod
+    def _extract_text_from_payload(payload: dict) -> str:
+        if not payload:
+            return ""
+        text = payload.get("text")
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+        if "_node_content" in payload:
+            try:
+                nc = json.loads(payload["_node_content"])
+                text = nc.get("text", "")
+                if isinstance(text, str):
+                    return text.strip()
+            except (json.JSONDecodeError, TypeError):
+                return ""
+        return ""
+
+    @staticmethod
+    def _merge_texts_with_overlap(texts: list[str]) -> str:
+        """
+        将同一 parent_id 下的多个叶子文本尽量合并为更长上下文（近似父块）。
+        """
+        merged = ""
+        for raw in texts:
+            cur = (raw or "").strip()
+            if not cur:
+                continue
+            if not merged:
+                merged = cur
+                continue
+            if cur in merged:
+                continue
+            if merged in cur:
+                merged = cur
+                continue
+            max_overlap = min(len(merged), len(cur), 120)
+            overlap = 0
+            for k in range(max_overlap, 20, -1):
+                if merged[-k:] == cur[:k]:
+                    overlap = k
+                    break
+            if overlap > 0:
+                merged = merged + cur[overlap:]
+            else:
+                merged = merged + "\n" + cur
+        return merged.strip()
+
+    def _resolve_parent_segment_token_budget(self) -> int:
+        """
+        计算 parent_child 返回给 LLM 的「单段父上下文」token 预算。
+
+        优先级：
+        1) 显式配置 RAG_PARENT_MAX_TOKENS_PER_SEGMENT（>0 时生效）；
+        2) 自动推导为 RAG_CHUNK_SIZE * RAG_FATHER_SON_RATIO。
+        """
+        explicit_budget = int(getattr(settings, "RAG_PARENT_MAX_TOKENS_PER_SEGMENT", 0) or 0)
+        if explicit_budget > 0:
+            return explicit_budget
+        ratio = max(1, int(getattr(settings, "RAG_FATHER_SON_RATIO", 3) or 3))
+        return max(1, int(settings.RAG_CHUNK_SIZE * ratio))
+
+    @staticmethod
+    def _clip_parent_text_for_budget(
+        parent_text: str,
+        leaf_text: str,
+        max_tokens: int,
+    ) -> tuple[str, bool]:
+        """
+        对父上下文做预算裁剪，围绕命中的 leaf 文本保留局部窗口。
+
+        采用字符级近似（2.5 chars/token），避免对每个节点进行 tiktoken 全文编码，
+        性能约为原 tiktoken 版本的 10 倍。精度损失在 ±20% 以内，可接受，因后续
+        postprocess/truncate.py 会做精确 token 预算兜底。
+        """
+        text = (parent_text or "").strip()
+        if not text or max_tokens <= 0:
+            return text, False
+
+        # 中英文混合保守估算：2.5 字符 ≈ 1 token
+        CHARS_PER_TOKEN = 2.5
+        budget_chars = int(max_tokens * CHARS_PER_TOKEN)
+        if len(text) <= budget_chars:
+            return text, False
+
+        # 用 leaf 文本前 80 字符作为锚点，定位在父文本中的位置
+        anchor = (leaf_text or "").strip()
+        probe = anchor[:80]
+        pos = text.find(probe) if probe else -1
+        if pos < 0 and len(probe) > 30:
+            pos = text.find(probe[:30])
+
+        if pos >= 0:
+            half = budget_chars // 2
+            start = max(0, pos - half)
+            end = min(len(text), start + budget_chars)
+            # 若尾部已到达末端，向前补充
+            if end - start < budget_chars:
+                start = max(0, end - budget_chars)
+            return text[start:end].strip(), True
+
+        # 找不到锚点：优先保留 leaf，再补充父块开头
+        if anchor:
+            anchor_chars = len(anchor)
+            if anchor_chars >= budget_chars:
+                return anchor[:budget_chars].strip(), True
+            remaining = budget_chars - anchor_chars - 2  # 2 for "\n\n"
+            head = text[:remaining].strip() if remaining > 0 else ""
+            mixed = f"{anchor}\n\n{head}".strip() if head else anchor
+            return mixed[:budget_chars].strip(), True
+
+        return text[:budget_chars].strip(), True
+
+    def _apply_source_level_filter(
+        self,
+        nodes: list,
+        kb_id: str = "",
+    ) -> list:
+        """
+        来源级别相对过滤：按来源文档分组，计算每个来源的最高分，
+        只保留最高分 >= 最佳来源分 * RAG_SOURCE_SCORE_RATIO 的整个来源。
+
+        与 segment 级过滤的区别：要么保留某来源的全部段落，要么整体排除。
+        对于针对特定文档的查询（如"合同中的专利条款"），该文档 BM25+向量分数
+        整体高于其他文档，其他文档会被整体过滤，避免 LLM 答非所问；
+        对于合理的跨文档查询，多个来源得分相近，则都保留。
+        """
+        ratio = getattr(settings, "RAG_SOURCE_SCORE_RATIO", 0.0) or 0.0
+        if not nodes or ratio <= 0:
+            return nodes
+
+        source_max: dict[str, float] = {}
+        for n in nodes:
+            src = ((getattr(n.node, "metadata", None) or {}).get("file_name") or "__unknown__")
+            sc = float(n.score or 0.0)
+            if sc > source_max.get(src, 0.0):
+                source_max[src] = sc
+
+        if not source_max:
+            return nodes
+
+        best = max(source_max.values())
+        threshold = best * ratio
+        kept_sources = {src for src, sc in source_max.items() if sc >= threshold}
+
+        before = len(nodes)
+        result = [
+            n for n in nodes
+            if ((getattr(n.node, "metadata", None) or {}).get("file_name") or "__unknown__") in kept_sources
+        ]
+
+        if len(result) < before:
+            logger.info(
+                "source级别过滤: kb=%s, best_score=%.4f, threshold=%.4f(ratio=%.2f), "
+                "sources_kept=%d/%d, segs=%d→%d",
+                kb_id, best, threshold, ratio,
+                len(kept_sources), len(source_max), before, len(result),
+            )
+        return result
+
+    @staticmethod
+    def _summarize_numeric_series(values: list[int]) -> dict[str, float]:
+        """
+        计算数值序列的统计摘要，用于分块诊断日志。
+        """
+        if not values:
+            return {
+                "count": 0.0,
+                "min": 0.0,
+                "p50": 0.0,
+                "p90": 0.0,
+                "max": 0.0,
+                "avg": 0.0,
+            }
+
+        ordered = sorted(int(v) for v in values)
+        n = len(ordered)
+
+        def _pick(percent: float) -> float:
+            idx = int((n - 1) * percent)
+            idx = max(0, min(n - 1, idx))
+            return float(ordered[idx])
+
+        return {
+            "count": float(n),
+            "min": float(ordered[0]),
+            "p50": _pick(0.50),
+            "p90": _pick(0.90),
+            "max": float(ordered[-1]),
+            "avg": float(sum(ordered)) / float(n),
+        }
+
+    def _collect_parent_ids_from_collection(self, kb_id: str) -> set[str]:
+        parent_ids: set[str] = set()
+        offset = None
+        while True:
+            records, next_offset = self.client.scroll(
+                collection_name=kb_id,
+                limit=_BM25_SCROLL_PAGE_SIZE,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for record in records:
+                payload = record.payload or {}
+                metadata = self._extract_metadata_from_payload(payload)
+                parent_id = str(metadata.get("_pc_parent_id", "") or "").strip()
+                if parent_id:
+                    parent_ids.add(parent_id)
+            if next_offset is None:
+                break
+            offset = next_offset
+        return parent_ids
+
+    def _prune_parent_text_map_by_collection(self, kb_id: str) -> None:
+        if not self.client.collection_exists(kb_id):
+            self._clear_parent_text_map(kb_id)
+            return
+        current_map = self._load_parent_text_map(kb_id)
+        if not current_map:
+            return
+        try:
+            alive_parent_ids = self._collect_parent_ids_from_collection(kb_id)
+        except Exception as e:
+            logger.warning("收集存活parent_id失败，跳过映射裁剪: kb=%s, err=%s", kb_id, e)
+            return
+        pruned = {pid: txt for pid, txt in current_map.items() if pid in alive_parent_ids}
+        if len(pruned) == len(current_map):
+            return
+        self._parent_text_cache[kb_id] = pruned
+        path = self._parent_store_path(kb_id)
+        try:
+            path.write_text(json.dumps(pruned, ensure_ascii=False), encoding="utf-8")
+            logger.info(
+                "parent文本映射已裁剪: kb=%s, before=%d, after=%d",
+                kb_id,
+                len(current_map),
+                len(pruned),
+            )
+        except Exception as e:
+            logger.warning("写回裁剪后的parent映射失败（不影响主流程）: kb=%s, err=%s", kb_id, e)
+
+    def _self_heal_parent_text_map(self, kb_id: str) -> None:
+        """
+        启动自愈：在 parent 映射缺失时，尝试从叶子 points 中按 _pc_parent_id 近似重建父上下文。
+        """
+        if not self.client.collection_exists(kb_id):
+            return
+        max_points = max(1000, int(getattr(settings, "RAG_PARENT_STORE_SELF_HEAL_MAX_POINTS", 50000) or 50000))
+        scanned = 0
+        offset = None
+        parent_leaf_texts: dict[str, list[str]] = {}
+        while True:
+            records, next_offset = self.client.scroll(
+                collection_name=kb_id,
+                limit=_BM25_SCROLL_PAGE_SIZE,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for record in records:
+                scanned += 1
+                payload = record.payload or {}
+                metadata = self._extract_metadata_from_payload(payload)
+                parent_id = str(metadata.get("_pc_parent_id", "") or "").strip()
+                if not parent_id:
+                    continue
+                text = self._extract_text_from_payload(payload)
+                if not text:
+                    continue
+                parent_leaf_texts.setdefault(parent_id, []).append(text)
+            if next_offset is None or scanned >= max_points:
+                break
+            offset = next_offset
+
+        if not parent_leaf_texts:
+            logger.warning("parent_store 自愈未找到可用 parent_id: kb=%s, scanned=%d", kb_id, scanned)
+            return
+
+        healed_map: dict[str, str] = {}
+        for parent_id, leaf_texts in parent_leaf_texts.items():
+            merged = self._merge_texts_with_overlap(leaf_texts)
+            if merged:
+                healed_map[parent_id] = merged
+
+        if not healed_map:
+            logger.warning("parent_store 自愈失败（无法拼装文本）: kb=%s, scanned=%d", kb_id, scanned)
+            return
+
+        self._save_parent_text_map(kb_id, healed_map)
+        logger.info(
+            "parent_store 自愈完成: kb=%s, scanned_points=%d, healed_parents=%d",
+            kb_id,
+            scanned,
+            len(healed_map),
+        )
+
+    def startup_parent_store_self_check(self) -> None:
+        """
+        启动自检：扫描 rag_parent_store 与当前 kb_* 集合一致性。
+        """
+        try:
+            collections = self.client.get_collections()
+            kb_ids = [c.name for c in collections.collections if c.name.startswith("kb_")]
+        except Exception as e:
+            logger.warning("启动自检：获取集合失败，跳过 parent_store 一致性检查: %s", e)
+            return
+
+        existing_keys = {self._parent_store_key(kb_id): kb_id for kb_id in kb_ids}
+        files = list(self._parent_store_dir.glob("*.json"))
+        store_keys = {f.stem for f in files}
+
+        missing_store = [existing_keys[k] for k in sorted(set(existing_keys.keys()) - store_keys)]
+        orphan_store = sorted(set(store_keys) - set(existing_keys.keys()))
+
+        empty_maps: list[str] = []
+        for kb_id in kb_ids:
+            parent_map = self._load_parent_text_map(kb_id)
+            if not parent_map:
+                empty_maps.append(kb_id)
+
+        logger.info(
+            "parent_store 启动自检: kb_collections=%d, store_files=%d, missing_store=%d, orphan_store=%d, empty_maps=%d",
+            len(kb_ids),
+            len(files),
+            len(missing_store),
+            len(orphan_store),
+            len(empty_maps),
+        )
+        if missing_store:
+            logger.warning("parent_store 缺失映射文件: %s", missing_store)
+        if orphan_store:
+            logger.warning("parent_store 存在孤儿映射文件（无对应kb）：%s", orphan_store)
+        if empty_maps:
+            logger.warning("parent_store 存在空映射（建议重建该KB）：%s", empty_maps)
+
+        if getattr(settings, "RAG_PARENT_STORE_SELF_HEAL_ENABLED", True):
+            for kb_id in missing_store + empty_maps:
+                try:
+                    self._self_heal_parent_text_map(kb_id)
+                except Exception as e:
+                    logger.warning("parent_store 自愈失败（不影响启动）: kb=%s, err=%s", kb_id, e)
 
     # ================================================================
     # URL 映射（Docker 内网）
@@ -236,6 +660,45 @@ class RagService:
             logger.info(f"Mapping external URL to internal: {url} -> {new_url} (Preserving Host: {original_host})")
 
         return new_url, headers
+
+    def _build_download_candidates(self, url: str) -> list[tuple[str, dict, str]]:
+        """
+        构建可回退的下载候选地址（用于预签名 URL 在容器网络差异下的鲁棒下载）。
+        """
+        parsed = urlparse(url)
+        original_host = parsed.netloc
+        host_only = original_host.split(":")[0] if original_host else ""
+        port = original_host.split(":")[1] if ":" in original_host else ""
+        candidates: list[tuple[str, dict, str]] = []
+        seen: set[str] = set()
+
+        def _append(candidate_url: str, candidate_headers: dict, label: str) -> None:
+            key = f"{candidate_url}|{candidate_headers.get('Host', '')}"
+            if key in seen:
+                return
+            seen.add(key)
+            candidates.append((candidate_url, candidate_headers, label))
+
+        primary_url, primary_headers = self._map_url_internally(url)
+        _append(primary_url, primary_headers, "primary_mapped")
+
+        # 可选回退（默认关闭）：仅在显式开启时尝试多内部主机，避免“隐式魔法配置”造成长期技术债。
+        enable_fallback = os.getenv("S3_DOWNLOAD_FALLBACK_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+        if enable_fallback and host_only in {"localhost", "127.0.0.1"}:
+            raw_candidates = os.getenv(
+                "S3_INTERNAL_HOST_CANDIDATES",
+                "host.docker.internal,minio,lobe",
+            )
+            for h in [x.strip() for x in raw_candidates.split(",") if x.strip()]:
+                mapped_host = f"{h}:{port}" if port else h
+                mapped_url = url.replace(original_host, mapped_host)
+                _append(mapped_url, {"Host": original_host}, f"fallback_host={h}")
+        elif host_only in {"localhost", "127.0.0.1"}:
+            logger.info("S3 下载候选回退已关闭（S3_DOWNLOAD_FALLBACK_ENABLED=false），仅使用 primary_mapped + original_url")
+
+        # 最后回退原始 URL（用于非容器或特殊网络场景）
+        _append(url, {}, "original_url")
+        return candidates
 
     # ================================================================
     # BM25 缓存管理
@@ -385,6 +848,11 @@ class RagService:
             if removed is not None:
                 logger.info(f"BM25 缓存已失效: collection='{kb_id}'")
 
+    def invalidate_vector_index_cache(self, kb_id: str) -> None:
+        removed = self._vector_indexes.pop(kb_id, None)
+        if removed is not None:
+            logger.info("Vector 索引缓存已失效: collection='%s'", kb_id)
+
     # ================================================================
     # 文档摄入
     # ================================================================
@@ -397,17 +865,33 @@ class RagService:
         - 自动提取文档标题并注入每个 chunk 的元数据
         - 摄入完成后自动失效 BM25 缓存
         """
-        # 如需要则将 URL 映射到 Docker 内网并获取必要请求头
-        internal_url, headers = self._map_url_internally(file_url)
-
         collection_name = kb_id
-        logger.info(f"Starting ingestion: file={file_name or internal_url}, kb_id={kb_id}")
+        logger.info(f"Starting ingestion: file={file_name or file_url}, kb_id={kb_id}")
 
         # 1. 下载文件
+        file_content: bytes | None = None
+        last_error: Exception | None = None
+        download_candidates = self._build_download_candidates(file_url)
         async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.get(internal_url, headers=headers)
-            response.raise_for_status()
-            file_content = response.content
+            for candidate_url, headers, label in download_candidates:
+                try:
+                    response = await client.get(candidate_url, headers=headers)
+                    if response.status_code >= 400:
+                        response.raise_for_status()
+                    file_content = response.content
+                    logger.info(
+                        "文件下载成功: kb=%s, source=%s, url=%s",
+                        kb_id, label, candidate_url,
+                    )
+                    break
+                except Exception as e:
+                    last_error = e
+                    logger.warning(
+                        "文件下载失败，尝试下一个候选: kb=%s, source=%s, url=%s, err=%s",
+                        kb_id, label, candidate_url, e,
+                    )
+        if file_content is None:
+            raise RuntimeError(f"All download candidates failed for file_url={file_url}, last_error={last_error}")
 
         # 2. 将内容保存到临时文件（LlamaIndex 的 reader 通常需要文件路径）
         suffix = os.path.splitext(file_name or file_url.split('?')[0])[1].lower()
@@ -452,18 +936,16 @@ class RagService:
             )
             storage_context = StorageContext.from_defaults(vector_store=vector_store)
 
-            from rag.chunking import (
-                build_chunking_transformations,
-                build_parent_child_nodes,
-                build_title_aware_nodes,
-            )
+            from rag.chunking import build_parent_child_nodes, build_simple_nodes
 
             chunk_strategy = (getattr(settings, "RAG_CHUNKING_STRATEGY", "simple") or "simple").lower()
             title_aware = getattr(settings, "RAG_CHUNKING_TITLE_AWARE", False)
+            father_son_ratio = max(1, int(getattr(settings, "RAG_FATHER_SON_RATIO", 3) or 3))
+            splitter_type = (getattr(settings, "RAG_SPLITTER_TYPE", "token") or "token").lower()
 
             logger.info(
-                "分块策略: strategy=%s, title_aware=%s, chunk_size=%d, num_docs=%d",
-                chunk_strategy, title_aware, settings.RAG_CHUNK_SIZE, len(documents),
+                "分块策略: strategy=%s, splitter_type=%s, title_aware=%s, chunk_size=%d, father_son_ratio=%d, num_docs=%d",
+                chunk_strategy, splitter_type, title_aware, settings.RAG_CHUNK_SIZE, father_son_ratio, len(documents),
             )
 
             # 6. 创建索引（解析 + 嵌入 + 写入）
@@ -473,6 +955,97 @@ class RagService:
                 leaf_nodes, all_nodes = build_parent_child_nodes(
                     documents,
                     title_aware=title_aware,
+                )
+                # 记录 parent_id 到父文本的映射（单份持久化，不把父全文重复塞进每个 leaf）。
+                parent_by_id = {
+                    getattr(node, "node_id", ""): node
+                    for node in all_nodes
+                    if getattr(node, "node_id", None)
+                }
+                parent_text_map: dict[str, str] = {}
+                enriched_leaf_count = 0
+                for leaf in leaf_nodes:
+                    rels = getattr(leaf, "relationships", {}) or {}
+                    parent_rel = rels.get(NodeRelationship.PARENT)
+                    if isinstance(parent_rel, list):
+                        parent_rel = parent_rel[0] if parent_rel else None
+                    parent_id = getattr(parent_rel, "node_id", None) if parent_rel else None
+                    if not parent_id:
+                        continue
+                    parent = parent_by_id.get(parent_id)
+                    if parent is None:
+                        continue
+                    parent_text = (getattr(parent, "text", "") or "").strip()
+                    if not parent_text:
+                        continue
+                    parent_text_map[parent_id] = parent_text
+                    leaf_meta = getattr(leaf, "metadata", {}) or {}
+                    leaf_meta["_pc_parent_id"] = parent_id
+                    leaf.metadata = leaf_meta
+                    enriched_leaf_count += 1
+                self._save_parent_text_map(collection_name, parent_text_map)
+
+                # parent_child 诊断日志：用于分析「父子节点数量比为何偏离 father_son_ratio」
+                try:
+                    encoding = tiktoken.get_encoding("cl100k_base")
+                    leaf_token_counts: list[int] = []
+                    children_per_parent: dict[str, int] = {}
+                    for leaf in leaf_nodes:
+                        leaf_text = (getattr(leaf, "text", "") or "").strip()
+                        if leaf_text:
+                            leaf_token_counts.append(len(encoding.encode(leaf_text)))
+
+                        rels = getattr(leaf, "relationships", {}) or {}
+                        parent_rel = rels.get(NodeRelationship.PARENT)
+                        if isinstance(parent_rel, list):
+                            parent_rel = parent_rel[0] if parent_rel else None
+                        pid = str(getattr(parent_rel, "node_id", "") or "").strip() if parent_rel else ""
+                        if pid:
+                            children_per_parent[pid] = children_per_parent.get(pid, 0) + 1
+
+                    parent_token_counts = [
+                        len(encoding.encode(text))
+                        for text in parent_text_map.values()
+                        if isinstance(text, str) and text.strip()
+                    ]
+                    child_per_parent_counts = list(children_per_parent.values())
+
+                    leaf_stats = self._summarize_numeric_series(leaf_token_counts)
+                    parent_stats = self._summarize_numeric_series(parent_token_counts)
+                    cpp_stats = self._summarize_numeric_series(child_per_parent_counts)
+                    observed_ratio = (
+                        float(len(leaf_nodes)) / float(max(1, len(parent_text_map)))
+                    )
+
+                    logger.info(
+                        "parent_child分块诊断: kb=%s, file=%s, expected_ratio=1:%d, observed_ratio=1:%.2f, leaf_nodes=%d, unique_parents=%d, leaf_tokens(avg/p50/p90/max)=%.0f/%.0f/%.0f/%.0f, parent_tokens(avg/p50/p90/max)=%.0f/%.0f/%.0f/%.0f, children_per_parent(avg/p50/p90/max)=%.2f/%.0f/%.0f/%.0f",
+                        kb_id,
+                        file_name or "unknown",
+                        father_son_ratio,
+                        observed_ratio,
+                        len(leaf_nodes),
+                        len(parent_text_map),
+                        leaf_stats["avg"],
+                        leaf_stats["p50"],
+                        leaf_stats["p90"],
+                        leaf_stats["max"],
+                        parent_stats["avg"],
+                        parent_stats["p50"],
+                        parent_stats["p90"],
+                        parent_stats["max"],
+                        cpp_stats["avg"],
+                        cpp_stats["p50"],
+                        cpp_stats["p90"],
+                        cpp_stats["max"],
+                    )
+                except Exception as diag_err:
+                    logger.warning("parent_child分块诊断日志生成失败（不影响主流程）: kb=%s, err=%s", kb_id, diag_err)
+
+                logger.info(
+                    "parent_child索引父信息写入: leaf_nodes=%d, enriched_with_parent_id=%d, unique_parents=%d",
+                    len(leaf_nodes),
+                    enriched_leaf_count,
+                    len(parent_text_map),
                 )
                 ingested_count = len(leaf_nodes)
                 ingested_unit_label = "leaf_nodes"
@@ -485,25 +1058,15 @@ class RagService:
                     show_progress=False,
                 )
             else:
-                if title_aware:
-                    title_nodes = build_title_aware_nodes(documents)
-                    ingested_count = len(title_nodes)
-                    ingested_unit_label = "nodes"
-                    index = VectorStoreIndex(
-                        nodes=title_nodes,
-                        storage_context=storage_context,
-                        embed_model=self.embed_model,
-                        show_progress=False,
-                    )
-                else:
-                    transformations = build_chunking_transformations()
-                    index = VectorStoreIndex.from_documents(
-                        documents,
-                        storage_context=storage_context,
-                        embed_model=self.embed_model,
-                        transformations=transformations,
-                        show_progress=False,
-                    )
+                simple_nodes = build_simple_nodes(documents, title_aware=title_aware)
+                ingested_count = len(simple_nodes)
+                ingested_unit_label = "nodes"
+                index = VectorStoreIndex(
+                    nodes=simple_nodes,
+                    storage_context=storage_context,
+                    embed_model=self.embed_model,
+                    show_progress=False,
+                )
 
             # 缓存索引，便于检索阶段在 parent_child 模式下访问 docstore
             self._vector_indexes[collection_name] = index
@@ -572,6 +1135,8 @@ class RagService:
             # 2. 清除 BM25 缓存
             logger.info(f"Invalidating BM25 cache for kb_id={kb_id}")
             self.invalidate_bm25_cache(kb_id)
+            self.invalidate_vector_index_cache(kb_id)
+            self._clear_parent_text_map(kb_id)
 
             # 3. 删除 PostgreSQL 元数据
             try:
@@ -630,8 +1195,11 @@ class RagService:
             # 2. 清除 BM25 缓存
             logger.info(f"Invalidating BM25 cache for kb_id={kb_id}")
             self.invalidate_bm25_cache(kb_id)
+            self.invalidate_vector_index_cache(kb_id)
+            # 3. 按当前集合存活 parent_id 裁剪映射，避免父映射无限增长/陈旧
+            self._prune_parent_text_map_by_collection(kb_id)
 
-            # 3. 从 PostgreSQL 元数据中删除文件记录
+            # 4. 从 PostgreSQL 元数据中删除文件记录
             try:
                 logger.info(f"Deleting file from KB metadata in PostgreSQL: kb_id={kb_id}, file_name={file_name}")
                 await kb_metadata.delete_file_from_kb_metadata(kb_id, file_name)
@@ -744,6 +1312,10 @@ class RagService:
                             embed_model=self.embed_model,
                         )
                         self._vector_indexes[kb_id] = index
+                        logger.info(
+                            "parent_child索引缓存未命中：kb=%s，从向量库重建索引（可能缺少父子docstore关系）",
+                            kb_id,
+                        )
 
                     base_multiplier = 3
                     recall_top_k = similarity_top_k * base_multiplier
@@ -756,7 +1328,12 @@ class RagService:
 
                     bm25_nodes: list[NodeWithScore] | None = None
                     if hybrid_enabled:
-                        bm25, corpus_size = self._get_or_build_bm25(kb_id, recall_top_k)
+                        # BM25 首次构建需要同步 scroll Qdrant；用 run_in_executor
+                        # 将其移入线程池，避免阻塞 asyncio event loop。
+                        loop = asyncio.get_event_loop()
+                        bm25, corpus_size = await loop.run_in_executor(
+                            None, self._get_or_build_bm25, kb_id, recall_top_k
+                        )
                         if bm25 is not None and corpus_size > 0:
                             bm25_nodes = bm25.retrieve(effective_query)
 
@@ -831,17 +1408,31 @@ class RagService:
                             )
                             continue
 
+                    # 来源级别过滤：过滤掉最高分明显低于最佳来源的整个来源文档，
+                    # 防止无关文档的段落混入 LLM 上下文导致答非所问。
+                    final_leaf_nodes = self._apply_source_level_filter(final_leaf_nodes, kb_id)
+                    if not final_leaf_nodes:
+                        continue
+
                     try:
-                        from llama_index.core.schema import NodeRelationship
+                        from llama_index.core.schema import NodeRelationship, TextNode
                     except Exception:
                         NodeRelationship = None  # type: ignore
+                        from llama_index.core.schema import TextNode
 
                     parent_nodes_map: dict[str, NodeWithScore] = {}
                     docstore = getattr(index, "storage_context", None)
                     docstore = getattr(docstore, "docstore", None)
+                    parent_text_map = self._load_parent_text_map(kb_id)
+                    parent_token_budget = self._resolve_parent_segment_token_budget()
+                    parent_resolved_count = 0
+                    fallback_parent_store_count = 0
+                    fallback_leaf_count = 0
+                    parent_truncated_count = 0
 
                     for nws in final_leaf_nodes:
                         node = nws.node
+                        leaf_text = (getattr(node, "text", "") or "").strip()
                         parent_id = None
                         parent_node = None
 
@@ -856,10 +1447,37 @@ class RagService:
                                     try:
                                         parent_node = docstore.get_node(candidate_id)
                                         parent_id = candidate_id
+                                        parent_resolved_count += 1
                                     except Exception:
                                         parent_node = None
 
                         if parent_node is None:
+                            # 服务重启后 docstore 关系可能不可用；使用 parent_id 到
+                            # 持久化 parent_text 映射恢复父上下文，避免退化为碎片 leaf。
+                            meta = getattr(node, "metadata", {}) or {}
+                            parent_id_meta = str(meta.get("_pc_parent_id", "") or "").strip()
+                            parent_text = parent_text_map.get(parent_id_meta, "").strip() if parent_id_meta else ""
+                            if parent_text:
+                                parent_node = TextNode(text=parent_text, metadata=meta)
+                                parent_id = parent_id_meta or getattr(node, "node_id", None) or str(id(node))
+                                fallback_parent_store_count += 1
+                            else:
+                                parent_node = node
+                                parent_id = getattr(node, "node_id", None) or str(id(node))
+                                fallback_leaf_count += 1
+
+                        parent_raw_text = (getattr(parent_node, "text", "") or "").strip() if parent_node is not None else ""
+                        clipped_parent_text, was_truncated = self._clip_parent_text_for_budget(
+                            parent_raw_text,
+                            leaf_text,
+                            parent_token_budget,
+                        )
+                        if clipped_parent_text:
+                            if was_truncated:
+                                parent_truncated_count += 1
+                            parent_meta = getattr(parent_node, "metadata", None) or getattr(node, "metadata", {}) or {}
+                            parent_node = TextNode(text=clipped_parent_text, metadata=parent_meta)
+                        else:
                             parent_node = node
                             parent_id = getattr(node, "node_id", None) or str(id(node))
 
@@ -873,6 +1491,20 @@ class RagService:
                     parent_nodes = sorted(
                         parent_nodes_map.values(),
                         key=lambda x: x.score, reverse=True,
+                    )
+
+                    logger.info(
+                        "parent_child父节点提升统计: kb=%s, leaf_in=%d, parent_resolved=%d, fallback_parent_store=%d, fallback_leaf=%d, unique_segments=%d, docstore_ready=%s, parent_store_size=%d, parent_budget_tokens=%d, parent_truncated=%d",
+                        kb_id,
+                        len(final_leaf_nodes),
+                        parent_resolved_count,
+                        fallback_parent_store_count,
+                        fallback_leaf_count,
+                        len(parent_nodes),
+                        bool(docstore is not None),
+                        len(parent_text_map),
+                        parent_token_budget,
+                        parent_truncated_count,
                     )
 
                     from rag.postprocess.segments import build_segments_from_nodes
@@ -898,7 +1530,10 @@ class RagService:
                     bm25 = None
                     corpus_size = 0
                     if hybrid_enabled:
-                        bm25, corpus_size = self._get_or_build_bm25(kb_id, recall_top_k)
+                        loop = asyncio.get_event_loop()
+                        bm25, corpus_size = await loop.run_in_executor(
+                            None, self._get_or_build_bm25, kb_id, recall_top_k
+                        )
 
                     search_req = SearchRequest(
                         query=effective_query,
@@ -979,6 +1614,11 @@ class RagService:
                             )
                             continue
 
+                    # 来源级别过滤：过滤掉最高分明显低于最佳来源的整个来源文档。
+                    final_nodes = self._apply_source_level_filter(final_nodes, kb_id)
+                    if not final_nodes:
+                        continue
+
                     from rag.postprocess.segments import build_segments_from_nodes
 
                     segments, segment_count = build_segments_from_nodes(
@@ -987,7 +1627,7 @@ class RagService:
                     all_segments.extend(segments)
 
             except Exception as e:
-                logger.error(f"Error querying collection {kb_id}: {str(e)}")
+                logger.error(f"Error querying collection {kb_id}: {str(e)}", exc_info=True)
                 continue
 
         if not all_segments:
