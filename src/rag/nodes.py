@@ -118,9 +118,14 @@ def create_tools_node_with_rounds_increment(
     """
     包装 ToolNode：在返回的 state 中带上 tool_rounds: 1。
     配合 additive reducer，这会使总计次数增加 1。
+    轨道 P3：注入 rag_messages 到 configurable，供 search_knowledge 做多轮指代解析。
     """
     async def _node(state: dict, config: RunnableConfig) -> dict:
-        result = await tool_node.ainvoke(state, config)
+        cfg = dict(config) if config else {}
+        configurable = dict(cfg.get("configurable") or {})
+        configurable["rag_messages"] = state.get("messages", [])
+        cfg["configurable"] = configurable
+        result = await tool_node.ainvoke(state, cfg)
         logger.info("[tools_node_with_rounds_increment] %s: +1", tool_rounds_key)
         return {**result, tool_rounds_key: 1}
     return _node

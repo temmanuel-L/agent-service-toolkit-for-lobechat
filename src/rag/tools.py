@@ -2,6 +2,7 @@ from typing import Type, List
 from langchain_core.tools import BaseTool
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
+from core.settings import settings
 from rag.service import rag_service
 from rag.utils import RAG_SEGMENT_SEPARATOR
 from utils.log_utils import get_logger
@@ -26,37 +27,48 @@ class SearchKnowledgeTool(BaseTool):
     async def _arun(self, query: str, config: RunnableConfig = None) -> str:
         """Query the rag_service. kb_ids 仅从 config.configurable 读取（由 handler 从请求注入），不来自模型参数。"""
         try:
-            kb_ids: List[str] | None = (config or {}).get("configurable", {}).get("kb_ids") if config else None
+            cfg = (config or {}).get("configurable") or {}
+            kb_ids: List[str] | None = cfg.get("kb_ids")
             if not kb_ids:
                 return "Error: No knowledge base IDs (kb_ids) provided for search. Please specify which knowledge base to search."
-            
+
+            # 轨道 P3：多轮指代解析，从对话历史解析「这篇文章」等
+            extra_filters = None
+            if getattr(settings, "RAG_QUERY_FILTER_INFERENCE_ENABLED", False):
+                messages = cfg.get("rag_messages") or []
+                if messages:
+                    from rag.search.filters import resolve_referent_from_messages
+                    resolved = resolve_referent_from_messages(query, messages)
+                    if resolved:
+                        extra_filters = {"doc_title": resolved}
+                        logger.info("Referent resolved from messages: doc_title='%s'", resolved[:60])
+
             logger.info(f"Tool search_knowledge: query='{query}', kb_ids={kb_ids}")
-            context = await rag_service.query_knowledge(query, kb_ids)
+            context = await rag_service.query_knowledge(query, kb_ids, extra_filters=extra_filters)
             
             if not context:
                 return "The knowledge base did not return any relevant segments for this specific query."
             
-            # 动态计算截断上限：完全绑定在 RAG_CHUNK_SIZE 与 RAG_DEFAULT_TOP_K 上，
-            # 方便通过这两个参数统一控制上下文长度与性能。
-            from core.settings import settings
+            # 动态计算截断上限：绑定 RAG_CHUNK_SIZE 与 RAG_CONTEXT_TOP_K（思路一：召回与上下文分离）
             from rag.postprocess.truncate import truncate_rag_result_token_aware
             import tiktoken
 
             strategy = (getattr(settings, "RAG_CHUNKING_STRATEGY", "simple") or "simple").lower()
             father_son_ratio = max(1, int(getattr(settings, "RAG_FATHER_SON_RATIO", 3) or 3))
             token_budget_multiplier = father_son_ratio if strategy == "parent_child" else 1
+            context_top_k = settings.RAG_CONTEXT_TOP_K or settings.RAG_DEFAULT_TOP_K
             dynamic_max_tokens = int(
-                settings.RAG_CHUNK_SIZE * settings.RAG_DEFAULT_TOP_K * token_budget_multiplier
+                settings.RAG_CHUNK_SIZE * context_top_k * token_budget_multiplier
             )
-            dynamic_max_segments = settings.RAG_DEFAULT_TOP_K
+            dynamic_max_segments = context_top_k
             logger.info(
-                "RAG运行时配置: strategy=%s, splitter_type=%s, chunk_size=%d, chunk_overlap=%d, father_son_ratio=%d, top_k=%d, truncate_max_tokens=%d, truncate_max_segments=%d",
+                "RAG运行时配置: strategy=%s, splitter_type=%s, chunk_size=%d, chunk_overlap=%d, father_son_ratio=%d, context_top_k=%d, truncate_max_tokens=%d, truncate_max_segments=%d",
                 strategy,
                 (getattr(settings, "RAG_SPLITTER_TYPE", "token") or "token").lower(),
                 settings.RAG_CHUNK_SIZE,
                 settings.RAG_CHUNK_OVERLAP,
                 father_son_ratio,
-                settings.RAG_DEFAULT_TOP_K,
+                context_top_k,
                 dynamic_max_tokens,
                 dynamic_max_segments,
             )

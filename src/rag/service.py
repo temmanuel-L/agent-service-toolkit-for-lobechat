@@ -130,6 +130,24 @@ def _looks_like_english_title_query(text: str) -> bool:
     return True
 
 
+def _longest_content_phrase(query: str, min_len: int = 10) -> str | None:
+    """
+    从查询中提取最长的「内容短语」，用于通用内容级 boost。
+
+    规则：取 query 中最长的连续子串，满足 (a) 长度 >= min_len，(b) 由字母/数字/空格或连续 CJK 组成。
+    用途：当 node.text 包含该短语时加分，作为「查询与段落内容重叠」的通用相关性信号。
+    """
+    if not query or len(query.strip()) < min_len:
+        return None
+    q = query.strip()
+    pattern = rf"[a-zA-Z0-9\s]{{{min_len},}}|[\u4e00-\u9fff]{{{min_len},}}"
+    matches = re.findall(pattern, q)
+    if not matches:
+        return None
+    best = max(matches, key=len)
+    return best.strip() if len(best.strip()) >= min_len else None
+
+
 def _section_title_boost(section_title: str, query_lower: str) -> float:
     """
     计算 section_title 与 query 之间的关键词重叠度，返回 boost 系数。
@@ -205,6 +223,10 @@ class RagService:
         # key=collection_name, value=(BM25Retriever, corpus_size)
         self._bm25_cache: dict[str, tuple] = {}
         self._bm25_lock = threading.Lock()
+
+        # ---- 轨道 B：doc_title 缓存（用于 metadata 预过滤）----
+        # key=kb_id, value=set of doc_title
+        self._doc_title_cache: dict[str, set[str]] = {}
 
         # ---- 向量索引 / docstore 缓存（按知识库维度）----
         # 说明：
@@ -310,6 +332,31 @@ class RagService:
             except (json.JSONDecodeError, TypeError):
                 return ""
         return ""
+
+    @staticmethod
+    def _prepend_metadata_prefix_to_nodes(nodes: list) -> None:
+        """
+        将 doc_title、file_name、author、section_title 等 metadata 拼入每个节点的 text，
+        使 embedding 包含文档级信息，便于检索时「参考文献」等 chunk 能匹配标题类 query。
+
+        与 BM25 侧的 meta_prefix 格式保持一致，修改节点 text 原地。
+        """
+        for node in nodes:
+            meta = getattr(node, "metadata", {}) or {}
+            text = (getattr(node, "text", "") or "").strip()
+            parts: list[str] = []
+            for key, label in [
+                ("doc_title", "TITLE"),
+                ("file_name", "FILE"),
+                ("author", "AUTHOR"),
+                ("section_title", "SECTION"),
+            ]:
+                val = str(meta.get(key, "") or "").strip()
+                if val:
+                    parts.append(f"[{label}] {val}")
+            if parts:
+                prefix = " ".join(parts)
+                setattr(node, "text", f"{prefix}\n\n{text}")
 
     @staticmethod
     def _merge_texts_with_overlap(texts: list[str]) -> str:
@@ -766,33 +813,35 @@ class RagService:
                             try:
                                 nc = json.loads(payload["_node_content"])
                                 text = nc.get("text", "")
-                                # 将节点元数据一并取出，用于构造前缀（doc_title / file_name 等）
                                 metadata = nc.get("metadata", {}) or {}
                             except (json.JSONDecodeError, TypeError):
                                 pass
                         if text:
-                            # 在 BM25 侧按需为文本加上轻量级元数据前缀，而不修改原始存储
-                            meta_prefix_parts: list[str] = []
-                            doc_title = str(metadata.get("doc_title", "")).strip()
-                            file_name = str(metadata.get("file_name", "")).strip()
-                            section_title = str(metadata.get("section_title", "")).strip()
-                            if doc_title:
-                                meta_prefix_parts.append(f"[TITLE] {doc_title}")
-                            if file_name:
-                                meta_prefix_parts.append(f"[FILE] {file_name}")
-                            if section_title:
-                                meta_prefix_parts.append(f"[SECTION] {section_title}")
-                            if meta_prefix_parts:
-                                meta_prefix = " ".join(meta_prefix_parts)
-                                text_with_prefix = f"{meta_prefix}\n\n{text}"
-                            else:
-                                text_with_prefix = text
+                            # 轨道 A 后：摄入时已拼入 metadata 前缀，此处仅对旧数据兜底补全
+                            if not (text.startswith("[TITLE]") or text.startswith("[FILE]")):
+                                meta_prefix_parts: list[str] = []
+                                doc_title = str(metadata.get("doc_title", "")).strip()
+                                file_name = str(metadata.get("file_name", "")).strip()
+                                section_title = str(metadata.get("section_title", "")).strip()
+                                if doc_title:
+                                    meta_prefix_parts.append(f"[TITLE] {doc_title}")
+                                if file_name:
+                                    meta_prefix_parts.append(f"[FILE] {file_name}")
+                                if section_title:
+                                    meta_prefix_parts.append(f"[SECTION] {section_title}")
+                                if meta_prefix_parts:
+                                    meta_prefix = " ".join(meta_prefix_parts)
+                                    text = f"{meta_prefix}\n\n{text}"
 
                             all_nodes.append(TextNode(
-                                text=text_with_prefix,
+                                text=text,
                                 id_=str(record.id),
                                 metadata=metadata,
                             ))
+                            # 轨道 B：顺带收集 doc_title 供预过滤缓存
+                            t = str(metadata.get("doc_title", "") or "").strip()
+                            if t:
+                                self._doc_title_cache.setdefault(kb_id, set()).add(t)
 
                     if next_offset is None or len(records) < _BM25_SCROLL_PAGE_SIZE:
                         break
@@ -833,6 +882,58 @@ class RagService:
 
         return _rr(nodes, query_str, top_k)
 
+    def _get_doc_titles_for_kb(self, kb_id: str) -> set[str]:
+        """
+        轨道 B：获取 KB 内所有唯一的 doc_title，用于 metadata 预过滤的模糊匹配。
+        优先从缓存读取，未命中时 scroll 收集并缓存。
+        """
+        cached = self._doc_title_cache.get(kb_id)
+        if cached is not None:
+            return cached
+        titles: set[str] = set()
+        try:
+            offset = None
+            while True:
+                records, next_offset = self.client.scroll(
+                    collection_name=kb_id,
+                    limit=min(500, _BM25_SCROLL_PAGE_SIZE),
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                for record in records:
+                    meta = self._extract_metadata_from_payload(record.payload or {})
+                    t = str(meta.get("doc_title", "") or "").strip()
+                    if t:
+                        titles.add(t)
+                if next_offset is None or len(records) < 500:
+                    break
+                offset = next_offset
+        except Exception as e:
+            logger.warning("doc_title cache scroll failed: kb=%s, err=%s", kb_id, e)
+        self._doc_title_cache[kb_id] = titles
+        return titles
+
+    def _get_matched_doc_titles(
+        self, kb_id: str, doc_title_filter: str
+    ) -> list[str]:
+        """
+        轨道 B：根据 filter 子串，从 KB 的 doc_title 集合中模糊匹配出精确值列表。
+        保守策略：filter 为子串 或 doc_title 为 filter 子串 均视为匹配。
+        """
+        filter_lower = doc_title_filter.lower().strip()
+        if not filter_lower or len(filter_lower) < 2:
+            return []
+        all_titles = self._get_doc_titles_for_kb(kb_id)
+        if not all_titles:
+            return []
+        matched: list[str] = []
+        for t in all_titles:
+            t_lower = t.lower()
+            if filter_lower in t_lower or t_lower in filter_lower:
+                matched.append(t)
+        return matched[:50]  # 限制数量，避免 MatchAny 过长
+
     def invalidate_bm25_cache(self, kb_id: str) -> None:
         """
         使指定 collection 的 BM25 缓存失效。
@@ -847,6 +948,7 @@ class RagService:
             removed = self._bm25_cache.pop(kb_id, None)
             if removed is not None:
                 logger.info(f"BM25 缓存已失效: collection='{kb_id}'")
+        self._doc_title_cache.pop(kb_id, None)
 
     def invalidate_vector_index_cache(self, kb_id: str) -> None:
         removed = self._vector_indexes.pop(kb_id, None)
@@ -1051,6 +1153,9 @@ class RagService:
                 ingested_unit_label = "leaf_nodes"
                 storage_context.docstore.add_documents(all_nodes)
 
+                # 轨道 A：metadata 拼入 chunk text，使 embedding 包含 doc_title 等，便于检索
+                self._prepend_metadata_prefix_to_nodes(leaf_nodes)
+
                 index = VectorStoreIndex(
                     nodes=leaf_nodes,
                     storage_context=storage_context,
@@ -1061,6 +1166,8 @@ class RagService:
                 simple_nodes = build_simple_nodes(documents, title_aware=title_aware)
                 ingested_count = len(simple_nodes)
                 ingested_unit_label = "nodes"
+                # 轨道 A：metadata 拼入 chunk text，使 embedding 包含 doc_title 等，便于检索
+                self._prepend_metadata_prefix_to_nodes(simple_nodes)
                 index = VectorStoreIndex(
                     nodes=simple_nodes,
                     storage_context=storage_context,
@@ -1173,7 +1280,6 @@ class RagService:
             # 1. 从 Qdrant 中删除该文件的 points (通过 metadata filter)
             if self.client.collection_exists(kb_id):
                 logger.info(f"Deleting file from Qdrant collection: kb_id={kb_id}, file_name={file_name}")
-                # 使用 filter 直接删除特定 file_name 的 points
                 try:
                     self.client.delete(
                         collection_name=kb_id,
@@ -1221,6 +1327,7 @@ class RagService:
         query_str: str,
         kb_ids: List[str],
         similarity_top_k: int | None = None,
+        extra_filters: dict | None = None,
     ) -> str:
         """
         跨多个知识库（collection）进行混合检索。
@@ -1236,13 +1343,15 @@ class RagService:
         Args:
             query_str: 查询字符串
             kb_ids: 要查询的知识库 ID 列表
-            similarity_top_k: 返回的最相关文本块数量，默认使用 settings.RAG_DEFAULT_TOP_K
+            similarity_top_k: 若传入则覆盖 RAG_RECALL_TOP_K/RAG_CONTEXT_TOP_K，否则使用思路一分离配置
 
         Returns:
             str: 格式化的检索结果，每个段落带有 [Knowledge Segment N] 标记
         """
-        if similarity_top_k is None:
-            similarity_top_k = settings.RAG_DEFAULT_TOP_K
+        recall_pool_size = settings.RAG_RECALL_TOP_K or settings.RAG_DEFAULT_TOP_K
+        context_top_k = settings.RAG_CONTEXT_TOP_K or settings.RAG_DEFAULT_TOP_K
+        if similarity_top_k is not None:
+            recall_pool_size = context_top_k = similarity_top_k
         if not kb_ids:
             return ""
 
@@ -1251,7 +1360,7 @@ class RagService:
         mode_label = "hybrid(vector+BM25)" if hybrid_enabled else "vector-only"
         logger.info(
             f"知识库检索: query='{query_str[:50]}...', kb_ids={kb_ids}, "
-            f"top_k={similarity_top_k}, mode={mode_label}"
+            f"recall_pool={recall_pool_size}, context_top_k={context_top_k}, mode={mode_label}"
         )
 
         # ---- 可选 HyDE Query 改写（仅影响向量检索，不改变原始 query 日志与 BM25 查询）----
@@ -1285,6 +1394,10 @@ class RagService:
                     logger.info("Query filter inference enabled, inferred filters: %s", inferred_filters)
             except Exception as filter_err:
                 logger.warning(f"Query filter inference failed, skip filters: {filter_err}")
+        # 轨道 P3：合并多轮指代解析得到的 extra_filters（优先使用）
+        if extra_filters:
+            inferred_filters = {**inferred_filters, **extra_filters}
+            logger.info("Merged extra_filters (e.g. from referent resolution): %s", extra_filters)
 
         all_segments: list[str] = []
         segment_count = 1
@@ -1318,12 +1431,31 @@ class RagService:
                         )
 
                     base_multiplier = 3
-                    recall_top_k = similarity_top_k * base_multiplier
+                    recall_top_k = recall_pool_size * base_multiplier
                     if _looks_like_english_title_query(effective_query):
-                        recall_top_k = max(recall_top_k, similarity_top_k * 6)
+                        recall_top_k = max(recall_top_k, recall_pool_size * 6)
                     recall_top_k = min(recall_top_k, 80)
 
-                    retriever = index.as_retriever(similarity_top_k=recall_top_k)
+                    # 轨道 B：若有 doc_title filter，构建 Qdrant 预过滤
+                    vector_store_kwargs: dict = {}
+                    if inferred_filters:
+                        dt = str(inferred_filters.get("doc_title", "") or "").strip()
+                        if dt:
+                            match_list = self._get_matched_doc_titles(kb_id, dt)
+                            if match_list:
+                                from rag.search.filters import build_qdrant_doc_title_filter
+                                qf = build_qdrant_doc_title_filter(match_list)
+                                if qf is not None:
+                                    vector_store_kwargs["qdrant_filters"] = qf
+                                    logger.info(
+                                        "parent_child: applying doc_title pre-filter, match_count=%d",
+                                        len(match_list),
+                                    )
+
+                    retriever = index.as_retriever(
+                        similarity_top_k=recall_top_k,
+                        vector_store_kwargs=vector_store_kwargs if vector_store_kwargs else {},
+                    )
                     vector_nodes = await retriever.aretrieve(effective_query)
 
                     bm25_nodes: list[NodeWithScore] | None = None
@@ -1348,15 +1480,15 @@ class RagService:
                             recall_top_k,
                             bm25_weight=bm25_weight,
                         )
-                        fused_nodes = fused_nodes[:similarity_top_k]
+                        fused_nodes = fused_nodes[:recall_pool_size]
                     else:
-                        fused_nodes = vector_nodes[:similarity_top_k]
+                        fused_nodes = vector_nodes[:recall_pool_size]
 
                     vector_ms = (time.perf_counter() - t0) * 1000
 
                     final_leaf_nodes = fused_nodes
                     if settings.RAG_RERANK_ENABLED:
-                        rerank_top_k = min(settings.RAG_RERANK_TOP_K, similarity_top_k)
+                        rerank_top_k = min(settings.RAG_RERANK_TOP_K, context_top_k)
                         t_rerank = time.perf_counter()
                         final_leaf_nodes = self._rerank_nodes(
                             fused_nodes, query_str, top_k=rerank_top_k
@@ -1370,6 +1502,7 @@ class RagService:
                         )
                     else:
                         q_lower = query_str.lower()
+                        content_phrase = _longest_content_phrase(query_str)
                         boosted_nodes: list[NodeWithScore] = []
                         for nws in fused_nodes:
                             boost = 0.0
@@ -1387,16 +1520,28 @@ class RagService:
                                 if any(pattern in content_sample for pattern in ["甲方:", "甲方：", "乙方:", "乙方：", "委托方", "受托方", "（甲方）", "（乙方）"]):
                                     boost += 0.4 * nws.score
 
+                            if content_phrase:
+                                full_text = (getattr(nws.node, "text", "") or "").strip()
+                                if content_phrase.lower() in full_text.lower():
+                                    boost += 0.6 * (nws.score or 0.01)
+
                             boosted_nodes.append(NodeWithScore(
                                 node=nws.node, score=nws.score + boost,
                             ))
 
                         boosted_nodes.sort(key=lambda x: x.score, reverse=True)
-                        final_leaf_nodes = boosted_nodes[:similarity_top_k]
+                        final_leaf_nodes = boosted_nodes[:context_top_k]
                         total_ms = (time.perf_counter() - t0) * 1000
                         logger.info(
                             "检索(启发式重排, parent_child): kb=%s, results=%d, total=%.0fms",
                             kb_id, len(final_leaf_nodes), total_ms,
+                        )
+
+                    # 轨道 C：metadata 后过滤（parent_child 接入 filters，与 simple 统一）
+                    if inferred_filters:
+                        from rag.search.filters import apply_search_filters_to_nodes
+                        final_leaf_nodes = apply_search_filters_to_nodes(
+                            final_leaf_nodes, inferred_filters
                         )
 
                     min_score = getattr(settings, "RAG_MIN_RELEVANCE_SCORE", 0.0) or 0.0
@@ -1522,9 +1667,9 @@ class RagService:
                     )
 
                     base_multiplier = 3
-                    recall_top_k = similarity_top_k * base_multiplier
+                    recall_top_k = recall_pool_size * base_multiplier
                     if _looks_like_english_title_query(effective_query):
-                        recall_top_k = max(recall_top_k, similarity_top_k * 6)
+                        recall_top_k = max(recall_top_k, recall_pool_size * 6)
                     recall_top_k = min(recall_top_k, 80)
 
                     bm25 = None
@@ -1535,11 +1680,19 @@ class RagService:
                             None, self._get_or_build_bm25, kb_id, recall_top_k
                         )
 
+                    # 轨道 B：若有 doc_title filter，计算匹配列表用于 Qdrant 预过滤
+                    doc_title_match_list: list[str] | None = None
+                    if inferred_filters:
+                        dt = str(inferred_filters.get("doc_title", "") or "").strip()
+                        if dt:
+                            doc_title_match_list = self._get_matched_doc_titles(kb_id, dt)
+
                     search_req = SearchRequest(
                         query=effective_query,
                         kb_ids=[kb_id],
                         top_k=recall_top_k,
                         filters=inferred_filters,
+                        doc_title_match_list=doc_title_match_list,
                     )
 
                     search_result = await hybrid_search_single_kb(
@@ -1562,7 +1715,7 @@ class RagService:
 
                     final_nodes = vector_nodes
                     if settings.RAG_RERANK_ENABLED:
-                        rerank_top_k = min(settings.RAG_RERANK_TOP_K, similarity_top_k)
+                        rerank_top_k = min(settings.RAG_RERANK_TOP_K, context_top_k)
                         t_rerank = time.perf_counter()
                         final_nodes = self._rerank_nodes(
                             vector_nodes, query_str, top_k=rerank_top_k
@@ -1576,6 +1729,7 @@ class RagService:
                         )
                     else:
                         q_lower = query_str.lower()
+                        content_phrase = _longest_content_phrase(query_str)
                         boosted_nodes: list[NodeWithScore] = []
                         for nws in vector_nodes:
                             boost = 0.0
@@ -1593,12 +1747,17 @@ class RagService:
                                 if any(pattern in content_sample for pattern in ["甲方:", "甲方：", "乙方:", "乙方：", "委托方", "受托方", "（甲方）", "（乙方）"]):
                                     boost += 0.4 * nws.score
 
+                            if content_phrase:
+                                full_text = (getattr(nws.node, "text", "") or "").strip()
+                                if content_phrase.lower() in full_text.lower():
+                                    boost += 0.6 * (nws.score or 0.01)
+
                             boosted_nodes.append(NodeWithScore(
                                 node=nws.node, score=nws.score + boost,
                             ))
 
                         boosted_nodes.sort(key=lambda x: x.score, reverse=True)
-                        final_nodes = boosted_nodes[:similarity_top_k]
+                        final_nodes = boosted_nodes[:context_top_k]
                         total_ms = (time.perf_counter() - t0) * 1000
                         logger.info(
                             "检索(启发式重排): kb=%s, results=%d, total=%.0fms",

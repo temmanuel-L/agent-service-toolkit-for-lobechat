@@ -53,7 +53,22 @@ async def hybrid_search_single_kb(
     base_multiplier = 3
     recall_top_k = min(similarity_top_k * base_multiplier, 80)
 
-    vector_retriever = index.as_retriever(similarity_top_k=recall_top_k)
+    # 轨道 B：若有 doc_title 预过滤列表，构建 Qdrant filter
+    vector_store_kwargs: dict = {}
+    if request.doc_title_match_list:
+        from rag.search.filters import build_qdrant_doc_title_filter
+        qdrant_filter = build_qdrant_doc_title_filter(request.doc_title_match_list)
+        if qdrant_filter is not None:
+            vector_store_kwargs["qdrant_filters"] = qdrant_filter
+            logger.info(
+                "Search(single_kb): applying doc_title pre-filter, match_count=%d",
+                len(request.doc_title_match_list),
+            )
+
+    vector_retriever = index.as_retriever(
+        similarity_top_k=recall_top_k,
+        vector_store_kwargs=vector_store_kwargs if vector_store_kwargs else {},
+    )
     vector_nodes: List[NodeWithScore] = await vector_retriever.aretrieve(query)
     vector_ms = (time.perf_counter() - t0) * 1000
 

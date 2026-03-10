@@ -209,14 +209,16 @@ class Settings(BaseSettings):
     # 让每个 chunk 更接近「一条/几条条款」，有利于命中精确实体（如甲方/乙方名称）。
     RAG_CHUNK_SIZE: int = 512           # 文档分块的目标大小（token 级），适中偏小
     RAG_CHUNK_OVERLAP: int = 64         # 相邻块重叠 token 数，保持在 chunk_size 的约 10–15%
-    RAG_SPLITTER_TYPE: str = "token"    # 分块器类型: "token" 或 "sentence"
+    RAG_SPLITTER_TYPE: str = "recursive"    # 分块器类型: "token" | "sentence" | "recursive"
     RAG_FATHER_SON_RATIO: int = 3       # parent_child 模式下父块/子块倍率（父块≈子块*倍率）
     # parent_child 检索时，每个返回父段落的最大 token（0=自动按 chunk_size*father_son_ratio 推导）
     # 目的：避免个别超长父块导致上下文预算被单段吞噬。
     RAG_PARENT_MAX_TOKENS_PER_SEGMENT: int = 0
     RAG_PARENT_STORE_SELF_HEAL_ENABLED: bool = True   # 启动时若 parent 映射缺失，是否自动尝试自愈重建
     RAG_PARENT_STORE_SELF_HEAL_MAX_POINTS: int = 50000  # 自愈扫描单个KB的最大 points 数（防止超大库启动过慢）
-    RAG_DEFAULT_TOP_K: int = 8          # 单次检索返回的最相关文本块数量（向量/混合检索最终截断条数）
+    RAG_DEFAULT_TOP_K: int = 8          # 保留兼容：当 RAG_RECALL_TOP_K/RAG_CONTEXT_TOP_K 为 0 时作为兜底
+    RAG_RECALL_TOP_K: int = 20           # 召回候选数（RRF 融合后保留条数），0 时使用 RAG_DEFAULT_TOP_K
+    RAG_CONTEXT_TOP_K: int = 10           # 传给 LLM 的段数（决定上下文窗口），0 时使用 RAG_DEFAULT_TOP_K
     RAG_HYBRID_SEARCH: bool = True      # 是否启用 BM25 + 向量的混合检索（关闭则仅向量检索）
     # BM25 权重适当上调至 0.35：关键词信号更强，对"春节值班"/"专利条款"等精确查询，
     # BM25 能有效将正确来源文档的得分与无关文档拉开差距，从而让 source 级过滤更准确。
@@ -304,7 +306,7 @@ class Settings(BaseSettings):
                     self.AVAILABLE_MODELS.update(set(ZhipuModelName))
                 case Provider.OPENAI_COMPATIBLE:
                     if self.DEFAULT_MODEL is None:
-                        self.DEFAULT_MODEL = OpenAICompatibleName.GPT_4O_MINI
+                        self.DEFAULT_MODEL = OpenAICompatibleName.COMPATIBLE_GENERIC
                     self.AVAILABLE_MODELS.update(set(OpenAICompatibleName))
                 case Provider.OPENAI:
                     if self.DEFAULT_MODEL is None:

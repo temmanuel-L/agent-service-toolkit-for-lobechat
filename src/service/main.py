@@ -45,6 +45,15 @@ app = FastAPI(
 
 from core import settings
 
+
+@app.middleware("http")
+async def _log_kb_requests(request: Request, call_next):
+    """诊断用：记录 /api/kb/* 请求是否到达 agent（在认证之前执行）"""
+    if request.url.path.startswith("/api/kb/"):
+        logger.info("[KB] 收到请求: %s %s", request.method, request.url.path)
+    return await call_next(request)
+
+
 # 挂载静态文件目录
 try:
     if not settings.STATIC_DIR.exists():

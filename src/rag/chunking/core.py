@@ -4,7 +4,8 @@ RAG 分块（Chunking）核心工具。
 当前提供：
 - 基于 LlamaIndex SentenceSplitter 的固定窗口分块策略；
 - 基于 HierarchicalNodeParser 的父子分块策略（叶子向量索引 + 父节点上下文）；
-- 标题感知 + token 级两阶段分块策略（对标 RagFlow 的 Token + Title Chunker）。
+- 标题感知 + token 级两阶段分块策略（对标 RagFlow 的 Token + Title Chunker）；
+- RecursiveCharacterTextSplitter（LangChain）经 LangchainNodeParser 接入，支持 token/sentence/recursive 三种 splitter。
 """
 
 from __future__ import annotations
@@ -12,16 +13,82 @@ from __future__ import annotations
 import re
 
 import tiktoken
-from llama_index.core.node_parser import TokenTextSplitter, SentenceSplitter, HierarchicalNodeParser
+from llama_index.core.node_parser import (
+    HierarchicalNodeParser,
+    LangchainNodeParser,
+    SentenceSplitter,
+    TokenTextSplitter,
+)
 from llama_index.core.node_parser.relational.hierarchical import get_leaf_nodes
 from llama_index.core.schema import Document
 
 from core.settings import settings
 
+# RecursiveCharacterTextSplitter 分隔符：CJK 混合文档
+_SEPARATORS_CJK = [
+    "\n\n",
+    "\n",
+    "。",
+    "！",
+    "？",
+    ". ",
+    "! ",
+    "? ",
+    "；",
+    "; ",
+    "，",
+    ", ",
+    " ",
+    "",
+]
+# 非 CJK 文档
+_SEPARATORS_DEFAULT = ["\n\n", "\n", ". ", "! ", "? ", "; ", ", ", " ", ""]
+
 
 def _resolve_parent_size(base_size: int) -> int:
     ratio = max(1, int(getattr(settings, "RAG_FATHER_SON_RATIO", 3) or 3))
     return max(base_size * ratio, base_size + settings.RAG_CHUNK_OVERLAP)
+
+
+def _estimate_cjk_ratio(text: str, sample_size: int = 2000) -> float:
+    """采样估算 CJK 字符占比，用于 RecursiveCharacterTextSplitter 的字符换算。"""
+    if not text:
+        return 0.0
+    sample = text[:sample_size]
+    cjk_count = sum(1 for c in sample if "\u4e00" <= c <= "\u9fff" or "\u3400" <= c <= "\u4dbf")
+    return cjk_count / len(sample) if sample else 0.0
+
+
+def _build_recursive_splitter(
+    chunk_size: int,
+    chunk_overlap: int | None = None,
+    *,
+    sample_text: str = "",
+) -> LangchainNodeParser:
+    """
+    构建 RecursiveCharacterTextSplitter（经 LangchainNodeParser 包装）。
+
+    chunk_size/overlap 为 token 级目标；按 CJK 比例换算为字符数，纯字符级切分，不调用 tiktoken。
+    sample_text 为空时默认按 CJK（1.5 chars/token）换算，适合中英混合文档。
+    """
+    if chunk_overlap is None:
+        chunk_overlap = settings.RAG_CHUNK_OVERLAP
+    cjk_ratio = _estimate_cjk_ratio(sample_text) if sample_text else 0.5
+    is_cjk = cjk_ratio >= 0.30
+    chars_per_token = 1.5 if is_cjk else 4.0
+    chunk_size_chars = int(chunk_size * chars_per_token)
+    overlap_chars = int(chunk_overlap * chars_per_token)
+    separators = _SEPARATORS_CJK if is_cjk else _SEPARATORS_DEFAULT
+
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+    lc_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size_chars,
+        chunk_overlap=overlap_chars,
+        separators=separators,
+        length_function=len,
+    )
+    return LangchainNodeParser(lc_splitter=lc_splitter)
 
 
 def _build_sentence_splitter(
@@ -62,16 +129,24 @@ def _build_token_splitter(
 def _build_splitter(
     chunk_size: int,
     chunk_overlap: int | None = None,
+    *,
+    sample_text: str = "",
 ):
     if chunk_overlap is None:
         chunk_overlap = settings.RAG_CHUNK_OVERLAP
-    encoding = tiktoken.get_encoding("cl100k_base")
     splitter_type = (getattr(settings, "RAG_SPLITTER_TYPE", "token") or "token").lower()
     if splitter_type == "sentence":
+        encoding = tiktoken.get_encoding("cl100k_base")
         return _build_sentence_splitter(
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
             encoding=encoding,
+        )
+    if splitter_type == "recursive":
+        return _build_recursive_splitter(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            sample_text=sample_text,
         )
     return _build_token_splitter(
         chunk_size=chunk_size,
@@ -150,9 +225,18 @@ def build_parent_child_nodes(
     base_size = settings.RAG_CHUNK_SIZE
     parent_size = _resolve_parent_size(base_size)
     parser_ids = ["pc_parent", "pc_child"]
+    sample_text = ""
+    if expanded_docs:
+        sample_text = " ".join(
+            (getattr(d, "text", "") or "")[:3000] for d in expanded_docs[:3]
+        )
     parser_map = {
-        parser_ids[0]: _build_splitter(parent_size, settings.RAG_CHUNK_OVERLAP),
-        parser_ids[1]: _build_splitter(base_size, settings.RAG_CHUNK_OVERLAP),
+        parser_ids[0]: _build_splitter(
+            parent_size, settings.RAG_CHUNK_OVERLAP, sample_text=sample_text
+        ),
+        parser_ids[1]: _build_splitter(
+            base_size, settings.RAG_CHUNK_OVERLAP, sample_text=sample_text
+        ),
     }
     parser = HierarchicalNodeParser.from_defaults(
         node_parser_ids=parser_ids,
@@ -310,16 +394,24 @@ def build_simple_nodes(
     title_aware: bool | None = None,
 ) -> list:
     """
-    simple 策略统一分块入口（token 优先）。
+    simple 策略统一分块入口（token / sentence / recursive）。
 
-    - title_aware=False: 直接按 token 窗口分块；
-    - title_aware=True : 先按标题切 section，再按 token 窗口分块。
+    - title_aware=False: 直接按 RAG_SPLITTER_TYPE 分块；
+    - title_aware=True : 先按标题切 section，再按 RAG_SPLITTER_TYPE 分块。
     """
     if title_aware is None:
         title_aware = getattr(settings, "RAG_CHUNKING_TITLE_AWARE", False)
     if title_aware:
         return build_title_aware_nodes(documents, chunk_size=settings.RAG_CHUNK_SIZE)
-    splitter = build_default_sentence_splitter()
+    sample_text = ""
+    if documents:
+        sample_text = " ".join(
+            (getattr(d, "text", "") or "")[:3000] for d in documents[:3]
+        )
+    splitter = _build_splitter(
+        chunk_size=settings.RAG_CHUNK_SIZE,
+        sample_text=sample_text,
+    )
     return splitter.get_nodes_from_documents(documents)
 
 

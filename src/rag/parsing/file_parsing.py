@@ -59,14 +59,30 @@ def _extract_doc_title(file_path: str, documents: list, file_name: Optional[str]
 
     # ---- 策略 2: 从首页内容中启发式提取 ----
     if documents:
-        first_text = documents[0].text[:1000]
+        first_text = documents[0].text[:1500]
         lines = [line.strip() for line in first_text.split("\n") if line.strip()]
-        # 跳过纯数字行（页码）、过长行（正文段落）
-        for line in lines[:8]:
-            # 好的标题特征：长度适中（5-300 字符），不以数字开头（排除页码）
+        candidates: List[Tuple[str, float]] = []
+        for line in lines[:12]:
             if 5 < len(line) < 300 and not line[0].isdigit():
-                logger.debug(f"从首页内容提取标题: '{line[:80]}'")
-                return line
+                score = 0.0
+                # 更像标题：长度 15–120（典型标题），多词（英文 4+ 词），无作者标记
+                if 15 <= len(line) <= 120:
+                    score += 1.0
+                words = line.split()
+                if len(words) >= 4:
+                    score += 0.5
+                if not re.search(r",|PhD|Prof|Dr\.?|MSc|Eng\.|DSc", line, re.I):
+                    score += 0.5
+                if re.search(r"[a-zA-Z]{4,}", line) and not re.search(r"[\u4e00-\u9fff]", line):
+                    score += 0.3  # 英文标题
+                candidates.append((line, score))
+        if candidates:
+            best = max(candidates, key=lambda x: x[1])
+            if best[1] > 0:
+                logger.debug(f"从首页内容提取标题: '{best[0][:80]}' (score={best[1]:.1f})")
+                return best[0]
+            logger.debug(f"从首页内容提取标题: '{candidates[0][0][:80]}'")
+            return candidates[0][0]
 
     # ---- 策略 3: 从文件名推断 ----
     if file_name:

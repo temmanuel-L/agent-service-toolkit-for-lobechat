@@ -6,7 +6,7 @@ RAG 检索（Search）阶段的数据模型。
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional  # noqa: F401 - List used in doc_title_match_list
 
 from pydantic import BaseModel, Field
 
@@ -26,6 +26,10 @@ class SearchRequest(BaseModel):
     filters: Dict[str, Any] = Field(
         default_factory=dict,
         description="结构化过滤条件（如按作者/文件名筛选），将映射为底层 Qdrant filter。",
+    )
+    doc_title_match_list: List[str] | None = Field(
+        default=None,
+        description="轨道 B：预过滤时匹配的 doc_title 精确值列表，用于构建 Qdrant MatchAny filter。",
     )
 
 

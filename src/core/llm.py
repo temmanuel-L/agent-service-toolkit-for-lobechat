@@ -103,11 +103,11 @@ def get_model(model_name: AllModelEnum, /) -> ModelT:
             raise ValueError("OpenAICompatible provider is active but missing required base_url configuration.")
         
         return ChatOpenAI(
-            model=settings.COMPATIBLE_MODEL or api_model_name,
+            model=api_model_name,
             temperature=0.5,
             streaming=True,
-            base_url=settings.COMPATIBLE_BASE_URL or settings.DMX_CHAT_URL,
-            api_key=settings.COMPATIBLE_API_KEY or (settings.OPENAI_API_KEY.get_secret_value() if settings.OPENAI_API_KEY else None),
+            base_url=settings.COMPATIBLE_BASE_URL,
+            api_key=settings.COMPATIBLE_API_KEY,
         )
     if model_name in AzureOpenAIModelName:
         if not settings.AZURE_OPENAI_API_KEY or not settings.AZURE_OPENAI_ENDPOINT:
@@ -156,7 +156,7 @@ def get_model(model_name: AllModelEnum, /) -> ModelT:
         if settings.DMX_CHAT_URL or settings.COMPATIBLE_BASE_URL:
             # 创建一个用于回退的 DMX 模型
             fallback_model = ChatOpenAI(
-                model=settings.COMPATIBLE_MODEL or OpenAICompatibleName.GPT_4O_MINI.value,
+                model=settings.COMPATIBLE_MODEL or OpenAICompatibleName.COMPATIBLE_GENERIC.value,
                 temperature=0.5,
                 streaming=True,
                 base_url=settings.COMPATIBLE_BASE_URL or settings.DMX_CHAT_URL,

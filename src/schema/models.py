@@ -102,7 +102,8 @@ class OpenRouterModelName(StrEnum):
 class OpenAICompatibleName(StrEnum):
     """https://platform.openai.com/docs/guides/text-generation"""
 
-    GPT_4O_MINI = "gpt-4o-mini"
+    # COMPATIBLE_GENERIC = "gpt-4o-mini"
+    COMPATIBLE_GENERIC = "MiniMax-M2.5"
 
 
 class ZhipuModelName(StrEnum):
