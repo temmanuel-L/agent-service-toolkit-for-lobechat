@@ -206,6 +206,7 @@ def get_embedding_model(embedding_provider: str = "ollama") -> Any:
     if settings.OLLAMA_EMBEDDING_MODEL and settings.OLLAMA_BASE_URL:
         if is_ollama_reachable(settings.OLLAMA_BASE_URL):
             try:
+                logger.info(f'embedding_model_name: {_EMBEDDING_MODEL_TABLE["ollama"]}')
                 return OllamaEmbeddings(
                     model=_EMBEDDING_MODEL_TABLE["ollama"],
                     base_url=settings.OLLAMA_BASE_URL,
@@ -219,6 +220,7 @@ def get_embedding_model(embedding_provider: str = "ollama") -> Any:
     # 官方文档: POST https://open.bigmodel.cn/api/paas/v4/embeddings
     if settings.ZHIPU_API_KEY:
         try:
+            logger.info(f'embedding_model_name: {_EMBEDDING_MODEL_TABLE["zhipu"]}')
             return OpenAIEmbeddings(
                 model=_EMBEDDING_MODEL_TABLE["zhipu"],
                 base_url="https://open.bigmodel.cn/api/paas/v4",
@@ -230,6 +232,7 @@ def get_embedding_model(embedding_provider: str = "ollama") -> Any:
     # 3. OpenAI 代理服务 (DMX)
     if (settings.DMX_CHAT_URL or settings.COMPATIBLE_BASE_URL) and settings.OPENAI_API_KEY:
         try:
+            logger.info(f'embedding_model_name: {_EMBEDDING_MODEL_TABLE["openai"]}')
             return OpenAIEmbeddings(
                 model=_EMBEDDING_MODEL_TABLE["openai"],
                 base_url=settings.COMPATIBLE_BASE_URL or settings.DMX_CHAT_URL,
