@@ -16,6 +16,7 @@ from agents.rag_assistant.rag_assistant import rag_assistant
 from agents.research_assistant.research_assistant import research_assistant
 from agents.simple_travel_planner_agent.simple_travel_planner_agent import simple_travel_planner_agent
 from agents.music_composer.music_composer import music_composer_agent
+from agents.multi_agent_medical_assistant import multi_agent_medical_assistant
 from agents.parallelization.parallelization_agent import parallelization_agent
 from schema import AgentInfo
 
@@ -75,7 +76,11 @@ agents: dict[str, Agent] = {
     "parallelization-agent": Agent(
         description="An agent which can do multiple tasks in parallelization",
         graph_like=parallelization_agent,
-    )
+    ),
+    "multi-agent-medical-assistant": Agent(
+        description="Medical multi-agent assistant with RAG, image analysis, and web search.",
+        graph_like=multi_agent_medical_assistant,
+    ),
 }
 
 

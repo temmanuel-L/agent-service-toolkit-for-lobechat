@@ -1,0 +1,23 @@
+{
+  "rag_questions": [
+    "脑肿瘤的常见症状有哪些？",
+    "脑胶质瘤的分级标准是什么？",
+    "COVID-19 胸片有哪些典型表现？",
+    "皮肤黑色素瘤的 ABCDE 诊断标准是什么？",
+    "2024 年脑肿瘤治疗有哪些新进展？"
+  ],
+  "conversation_questions": [
+    "你好",
+    "谢谢",
+    "我头疼怎么办？"
+  ],
+  "web_search_questions": [
+    "最新的 COVID-19 治疗指南",
+    "2024 年 FDA 批准的脑肿瘤新药"
+  ],
+  "image_analysis_notes": {
+    "brain_mri": "上传脑 MRI 图像会路由到 BRAIN_TUMOR_AGENT",
+    "chest_xray": "上传胸片会路由到 CHEST_XRAY_AGENT",
+    "skin_lesion": "上传皮肤病变图会路由到 SKIN_LESION_AGENT"
+  }
+}

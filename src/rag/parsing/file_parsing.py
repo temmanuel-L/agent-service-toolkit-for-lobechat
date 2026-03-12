@@ -102,6 +102,27 @@ def parse_file_to_documents(
             - metadata:  统一的 DocumentMetadata 对象，供上层记录或持久化
     """
     logger.info(f"[parsing] Loading document from file: {file_path}")
+    inferred_file_name = file_name or os.path.basename(file_path)
+    ext = os.path.splitext(file_path)[1].lower()
+
+    # PDF: 优先使用 docling（需安装 pip install .[pdf-docling]），支持表格、图片描述
+    if ext == ".pdf":
+        try:
+            from rag.parsing.pdf_parsing import parse_pdf_to_documents
+
+            return parse_pdf_to_documents(
+                file_path,
+                kb_id=kb_id,
+                file_name=file_name,
+                file_url=file_url,
+            )
+        except ImportError as e:
+            logger.warning(
+                "docling not installed, falling back to SimpleDirectoryReader for PDF. "
+                "Install with: pip install .[pdf-docling]"
+            )
+            logger.debug(f"ImportError: {e}")
+
     reader = SimpleDirectoryReader(input_files=[file_path])
     documents = reader.load_data()
 

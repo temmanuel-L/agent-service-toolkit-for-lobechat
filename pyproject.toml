@@ -118,3 +118,10 @@ follow_untyped_imports = true
 [[tool.mypy.overrides]]
 module = ["langchain_mcp_adapters.*"]
 ignore_missing_imports = true
+
+[project.optional-dependencies]
+pdf-docling = [
+    "docling[vlm]>=2.31.0",
+    "docling-core>=2.28.0",
+    "docling-parse>=4.0.0",
+]
