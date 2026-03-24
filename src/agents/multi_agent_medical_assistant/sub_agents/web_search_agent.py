@@ -4,6 +4,7 @@
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig
 
+from agents.utils import get_silent_config
 from core import get_model, settings
 
 from agents.multi_agent_medical_assistant.state import MedicalAgentState, get_input_text
@@ -25,8 +26,11 @@ def run_web_search_agent(
         model = get_model(
             (config or {}).get("configurable", {}).get("model", settings.DEFAULT_MODEL)
         )
+        silent_cfg = get_silent_config(config or {})
         resp = model.invoke(
-            f"Based on web search results, summarize a helpful medical information response:\n\n{result}"
+            f"Based on web search results, summarize a helpful medical information response. "
+            f"Respond in the SAME LANGUAGE as the user's query (Chinese if user wrote in Chinese, English if in English).\n\n{result}",
+            config=silent_cfg,
         )
         content = resp.content if hasattr(resp, "content") else str(resp)
         return {"output": AIMessage(content=content), "agent_name": "WEB_SEARCH_PROCESSOR_AGENT"}

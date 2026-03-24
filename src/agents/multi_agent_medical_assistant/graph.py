@@ -76,11 +76,15 @@ image_classifier = ImageClassifier()
 
 
 def prepare_input(state: MedicalAgentState, config: RunnableConfig | None = None) -> dict:
-    """从 messages 提取 current_input，支持 agent_config.image_path。"""
+    """从 messages 提取本轮 latest human 输入，支持 agent_config.image_path。
+
+    设计要点：
+    - 每一轮都用最新的人类消息重置 current_input，而不是复用历史值，
+      否则多轮对话会一直拿到第一次的输入（比如始终是“你好”）。
+    - messages 仍然作为完整的对话历史存在，current_input 只表示“当前这一轮”的原始输入快照，
+      方便路由、子 agent 和 guardrails 使用。
+    """
     messages = state.get("messages") or []
-    current_input = state.get("current_input")
-    if current_input is not None:
-        return {}
 
     text = ""
     for m in reversed(messages):
@@ -88,6 +92,7 @@ def prepare_input(state: MedicalAgentState, config: RunnableConfig | None = None
             text = getattr(m, "content", "") or ""
             break
 
+    # 支持从 agent_config 传入 image_path，用于图像类 agent
     configurable = (config or {}).get("configurable", {})
     image_path = configurable.get("image_path")
     if image_path:
@@ -167,12 +172,13 @@ Which agent should handle this? Respond in JSON: {{\"agent\": \"AGENT_NAME\", \"
         (config or {}).get("configurable", {}).get("model", settings.DEFAULT_MODEL)
     )
     parser = JsonOutputParser(pydantic_object=AgentDecision)
+    # 路由决策为内部逻辑，不流式输出到前端，避免 SAFE/JSON 泄露
     chain = (
         ChatPromptTemplate.from_messages([("system", DECISION_PROMPT), ("human", "{input}")])
-        | model
+        | model.with_config(tags=["skip_stream"])
         | parser
     )
-    decision = chain.invoke({"input": prompt})
+    decision = chain.invoke({"input": prompt}, config=config)
 
     agent_name = decision.get("agent", "CONVERSATION_AGENT")
     confidence = float(decision.get("confidence", 0.9))

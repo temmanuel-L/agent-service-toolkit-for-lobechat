@@ -4,6 +4,7 @@
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig
 
+from agents.utils import get_silent_config
 from core import get_model, settings
 
 from agents.multi_agent_medical_assistant.state import MedicalAgentState, get_input_text
@@ -40,8 +41,9 @@ async def run_rag_agent(
 
 用户问题: {text}
 
-请给出准确、简洁的回答。"""
-    resp = model.invoke(prompt)
+请给出准确、简洁的回答。必须使用与用户问题相同的语言作答（用户用中文则用中文，用英文则用英文）。"""
+    silent_cfg = get_silent_config(config or {})
+    resp = model.invoke(prompt, config=silent_cfg)
     content = resp.content if hasattr(resp, "content") else str(resp)
     return {
         "output": AIMessage(content=content),
