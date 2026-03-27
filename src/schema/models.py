@@ -88,9 +88,9 @@ class OllamaModelName(StrEnum):
     """https://ollama.com/search"""
 
     # OLLAMA_GENERIC = "alibayram/Qwen3-30B-A3B-Instruct-2507:latest"
-    OLLAMA_GENERIC = "qwen3:30b-a3b-instruct-16k"
-    # OLLAMA_GENERIC = "qwen3.5:27b-16k"
-    # OLLAMA_GENERIC = "glm-4.7-flash"
+    # OLLAMA_GENERIC = "qwen3:30b-a3b-instruct-16k"
+    OLLAMA_GENERIC = "ministral-3:3b"
+    # OLLAMA_GENERIC = "frob/qwen3.5-instruct:9b"
 
 
 class OpenRouterModelName(StrEnum):
@@ -102,7 +102,7 @@ class OpenRouterModelName(StrEnum):
 class OpenAICompatibleName(StrEnum):
     """https://platform.openai.com/docs/guides/text-generation"""
 
-    GPT_4O_MINI = "gpt-4o-mini"
+    OPENAI_NAME = "MiniMax-M2.7-highspeed"
 
 
 class ZhipuModelName(StrEnum):

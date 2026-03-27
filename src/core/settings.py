@@ -274,9 +274,9 @@ class Settings(BaseSettings):
 
     def model_post_init(self, __context: Any) -> None:
         api_keys = {
+            Provider.OPENAI_COMPATIBLE: self.COMPATIBLE_API_KEY,
             Provider.OLLAMA: self.OLLAMA_MODEL and is_ollama_reachable(self.OLLAMA_BASE_URL),
             Provider.ZHIPU: self.ZHIPU_API_KEY,
-            Provider.OPENAI_COMPATIBLE: (self.COMPATIBLE_BASE_URL and self.COMPATIBLE_MODEL) or self.DMX_CHAT_URL,
             Provider.OPENAI: self.OPENAI_API_KEY,
             Provider.DEEPSEEK: self.DEEPSEEK_API_KEY,
             Provider.ANTHROPIC: self.ANTHROPIC_API_KEY,
@@ -294,6 +294,10 @@ class Settings(BaseSettings):
 
         for provider in active_keys:
             match provider:
+                case Provider.OPENAI_COMPATIBLE:
+                    if self.DEFAULT_MODEL is None:
+                        self.DEFAULT_MODEL = OpenAICompatibleName.OPENAI_NAME
+                    self.AVAILABLE_MODELS.update(set(OpenAICompatibleName))
                 case Provider.OLLAMA:
                     if self.DEFAULT_MODEL is None:
                         self.DEFAULT_MODEL = OllamaModelName.OLLAMA_GENERIC
@@ -302,10 +306,6 @@ class Settings(BaseSettings):
                     if self.DEFAULT_MODEL is None:
                         self.DEFAULT_MODEL = ZhipuModelName.GLM_4_6
                     self.AVAILABLE_MODELS.update(set(ZhipuModelName))
-                case Provider.OPENAI_COMPATIBLE:
-                    if self.DEFAULT_MODEL is None:
-                        self.DEFAULT_MODEL = OpenAICompatibleName.GPT_4O_MINI
-                    self.AVAILABLE_MODELS.update(set(OpenAICompatibleName))
                 case Provider.OPENAI:
                     if self.DEFAULT_MODEL is None:
                         self.DEFAULT_MODEL = OpenAIModelName.GPT_5_NANO

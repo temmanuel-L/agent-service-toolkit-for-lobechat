@@ -1,10 +1,11 @@
 from typing import Any
 from pydantic import BaseModel, Field
 
-from langchain_core.messages import ChatMessage
+from langchain_core.messages import ChatMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.types import StreamWriter
 
+from agents.multimodal_input_processor import MultimodalInputProcessor
 
 class CustomData(BaseModel):
     "Custom data being sent by an agent"
@@ -37,3 +38,20 @@ def get_silent_config(config: RunnableConfig) -> RunnableConfig:
         new_config["tags"].append("skip_stream")
 
     return new_config
+
+
+def build_interrupt_text_message_update(
+    user_response: Any,
+    *,
+    extraction_field: str = "extraction_input_text",
+) -> dict[str, Any]:
+    """
+    规范化 interrupt 回合的用户输入：
+    - messages 仅写入文本（避免 image_url 落入 checkpointer）
+    - extraction 字段仅写文本，供调用方按需二次增强
+    """
+    text = MultimodalInputProcessor.extract_text_only(user_response)
+    update: dict[str, Any] = {extraction_field: text}
+    if text:
+        update["messages"] = [HumanMessage(content=text)]
+    return update

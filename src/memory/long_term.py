@@ -731,14 +731,33 @@ class MemoryManager:
         if self._store and summary_inputs and _backend_uses_summary():
             interval = settings.LONG_TERM_MEMORY_COMPRESSION_INTERVAL or 1
             if interval <= 1:
+                logger.info(
+                    "摘要压缩配置: interval=%d（每轮压缩），本轮将直接调用摘要LLM",
+                    interval,
+                )
                 await self._aupdate_summary(user_id, summary_inputs, config=config)
                 summary_ok = True
             else:
                 pending = await self._aget_pending(user_id)
                 pending.extend(summary_inputs)
+                pending_count = len(pending)
+                remaining_to_compress = max(0, interval - pending_count)
+                logger.info(
+                    "摘要压缩进度: user=%s interval=%d pending=%d remaining=%d",
+                    user_id,
+                    interval,
+                    pending_count,
+                    remaining_to_compress,
+                )
                 if len(pending) >= interval:
                     await self._aupdate_summary(user_id, pending, config=config)
                     await self._aput_pending(user_id, [])
+                    logger.info(
+                        "摘要压缩触发: user=%s pending=%d >= interval=%d，已调用摘要LLM并清空缓冲",
+                        user_id,
+                        pending_count,
+                        interval,
+                    )
                     summary_ok = True
                 else:
                     await self._aput_pending(user_id, pending)

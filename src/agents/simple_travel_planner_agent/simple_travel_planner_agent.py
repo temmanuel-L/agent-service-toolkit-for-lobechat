@@ -16,15 +16,18 @@ from typing import Any, List, Literal, Optional
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import RunnableConfig
-from langgraph.graph import END, MessagesState, StateGraph
+from langgraph.graph import END, MessagesState, START, StateGraph
 from langgraph.managed import RemainingSteps
 from langgraph.types import interrupt
 from pydantic import BaseModel, Field
 
+from agents.multimodal_input_processor import MultimodalInputProcessor
+from agents.utils import build_interrupt_text_message_update
 from core import get_model, settings
 from utils.log_utils import get_logger
 
 logger = get_logger(__name__)
+INTERRUPT_IMAGE_ONLY_FALLBACK_TEXT = "[本轮仅收到图片，暂未识别出可用文本]"
 
 
 # =============================================================================
@@ -36,6 +39,11 @@ class PlannerState(MessagesState, total=False):
     interests: Optional[List[str]]
     itinerary: Optional[str]
     remaining_steps: RemainingSteps
+    # 当前轮输入快照：每一轮从最新 HumanMessage 规范化得到
+    current_user_text: Optional[str]
+    has_visual_input: Optional[bool]
+    # extract_info 的唯一输入源
+    extraction_input_text: Optional[str]
 
 
 # =============================================================================
@@ -65,6 +73,14 @@ FIELD_PROMPTS = {
     "destination": "请问你想去哪个城市或地方旅游？",
     "interests": "请告诉我你对这次旅行有哪些兴趣？（如：美食、历史古迹、自然风光、游乐园或者购物中心等）",
 }
+
+
+def _last_human_message(messages: List[Any]) -> HumanMessage | None:
+    """从后向前取最后一条 HumanMessage。"""
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage):
+            return msg
+    return None
 
 
 def get_missing_fields(state: PlannerState) -> List[str]:
@@ -125,6 +141,14 @@ EXTRACTION_SYSTEM_PROMPT = """你是一个信息提取助手。你的任务是�
 3. 只提取明确提到的信息，不猜测。
 4. 必须调用 TravelInfoExtraction 工具返回结果。"""
 
+VISION_SYSTEM_PROMPT = """你是旅行场景下的图像理解助手。请根据用户提供的图片（及附带文字），用简洁中文输出识别结果，便于后续抽取旅行目的地与兴趣。
+
+请尽量覆盖（有则写出，无则省略，不要编造）：
+- 国家、地区/省份、城市
+- 景点、地标、场馆等具体名称
+
+直接输出一段自然语言描述即可，不要输出 JSON 或列表编号。"""
+
 
 def _normalize_extraction_args(args: dict[str, Any]) -> dict[str, Any]:
     """将 LLM 返回的 tool call args 归一化：智谱等可能返回 'null' 或 '["x"]' 等字符串。"""
@@ -148,48 +172,117 @@ def _normalize_extraction_args(args: dict[str, Any]) -> dict[str, Any]:
 
 
 # =============================================================================
+# 节点：规范化当前轮输入
+# =============================================================================
+def normalize_input(state: PlannerState, config: RunnableConfig | None = None) -> dict[str, Any]:
+    """从最新 HumanMessage 生成当前轮输入快照，供后续路由/视觉/抽取统一消费。"""
+    messages = state.get("messages", [])
+    last_human = _last_human_message(messages)
+    if not last_human:
+        logger.info("[规范化输入] 无 HumanMessage，清空当前轮快照")
+        return {
+            "current_user_text": "",
+            "has_visual_input": False,
+            "extraction_input_text": "",
+        }
+
+    normalized = MultimodalInputProcessor.normalize_human_content(last_human.content)
+    logger.info(
+        "[规范化输入] has_visual=%s text_len=%s",
+        normalized["has_visual_input"],
+        len(normalized["current_user_text"] or ""),
+    )
+    return normalized
+
+
+# =============================================================================
+# 路由：纯文本走抽取；含图先视觉理解
+# =============================================================================
+def route_input_modality(state: PlannerState) -> Literal["vision", "text"]:
+    """根据规范化后的状态判断先视觉理解或直接进入抽取。"""
+    if state.get("has_visual_input"):
+        logger.info("[路由] 检测到图像 -> vision_enrich")
+        return "vision"
+    logger.info("[路由] 纯文本 -> extract_info")
+    return "text"
+
+
+# =============================================================================
+# 节点：多模态视觉理解（写入 extraction_input_text）
+# =============================================================================
+async def vision_enrich(state: PlannerState, config: RunnableConfig) -> dict:
+    """对含图输入调用多模态模型，将识别结果写入 extraction_input_text。"""
+    logger.info(f"--- [视觉理解] 剩余步数: {state.get('remaining_steps')} ---")
+    user_text = (state.get("current_user_text") or "").strip()
+    messages = state.get("messages", [])
+    last_human = _last_human_message(messages)
+    raw_content = last_human.content if last_human else ""
+    logger.info(f"[视觉理解] 用户可见文本: {user_text[:300]!r}")
+    if not state.get("has_visual_input"):
+        logger.info("[视觉理解] 当前轮无图像输入，直接沿用 extraction_input_text")
+        return {"extraction_input_text": user_text}
+
+    llm = get_model(config["configurable"].get("model", settings.DEFAULT_MODEL))
+    vision_text = await MultimodalInputProcessor.vision_to_text(
+        llm,
+        config,
+        VISION_SYSTEM_PROMPT,
+        raw_content,
+        logger=logger,
+        log_prefix="[视觉理解]",
+    )
+    logger.info(f"[视觉理解] 模型输出内容: {vision_text[:2000]!r}")
+
+    if user_text and vision_text:
+        merged = f"{user_text}\n\n[图片内容识别]\n{vision_text}"
+    elif vision_text:
+        merged = vision_text
+    else:
+        merged = user_text or ""
+
+    if not merged:
+        logger.warning("[视觉理解] 合并结果为空，仍进入抽取（可能无有效信息）")
+    else:
+        logger.info(f"[视觉理解] 写入 extraction_input_text: {merged[:2500]!r}")
+
+    return {"extraction_input_text": merged}
+
+
+# =============================================================================
 # 节点：使用 LLM + 工具调用抽取信息
 # =============================================================================
 async def extract_info(state: PlannerState, config: RunnableConfig) -> dict:
     """使用 LLM 与工具调用从最新用户消息中抽取旅行信息。"""
     logger.info(f"--- [抽取信息] 剩余步数: {state.get('remaining_steps')} ---")
-    messages = state.get("messages", [])
-    if not messages:
-        logger.info("No messages to extract from, skipping extraction")
+    extraction_input_text = (state.get("extraction_input_text") or "").strip()
+    if not extraction_input_text:
+        logger.info("当前轮无有效 extraction_input_text，跳过抽取")
         return {}
-    
+
     # 获取模型并绑定抽取工具
     llm = get_model(config["configurable"].get("model", settings.DEFAULT_MODEL))
     llm_with_tools = llm.bind_tools([TravelInfoExtraction])
-    
+
     # 带示例占位符的提示
     extraction_prompt = ChatPromptTemplate.from_messages([
         ("system", EXTRACTION_SYSTEM_PROMPT),
         MessagesPlaceholder(variable_name="examples"),
         ("human", "{user_message}"),
     ])
-    
-    # Get the last human message for extraction
-    last_human_msg = None
-    for msg in reversed(messages):
-        if isinstance(msg, HumanMessage):
-            last_human_msg = msg.content
-            break
-    
-    if not last_human_msg:
-        logger.info("未找到用户消息，跳过抽取")
-        return {}
-    
-    logger.info(f"Extracting info from: {last_human_msg}")
-    
+    logger.info(f"[抽取信息] extraction_input_text 长度: {len(extraction_input_text)}")
+    logger.info(f"[抽取信息] extraction_input_text 内容: {extraction_input_text[:2500]!r}")
+    if "[图片内容识别]" in extraction_input_text:
+        vision_section = extraction_input_text.split("[图片内容识别]", 1)[1].strip()
+        logger.info(f"[抽取信息] 图片识别片段: {vision_section[:2000]!r}")
+
     try:
         # Invoke LLM with tool calling - include few-shot examples
         formatted_messages = extraction_prompt.format_messages(
-            user_message=last_human_msg,
+            user_message=extraction_input_text,
             examples=EXTRACTION_EXAMPLES
         )
         response = await llm_with_tools.with_config(tags=["skip_stream"]).ainvoke(formatted_messages, config)
-        
+
         # 解析工具调用以得到抽取结果
         if response.tool_calls:
             tool_call = response.tool_calls[0]
@@ -203,13 +296,13 @@ async def extract_info(state: PlannerState, config: RunnableConfig) -> dict:
                 if not args.get("interests"):
                     args["interests"] = args["destination"]
                 args["destination"] = None
-            
+
             extracted = TravelInfoExtraction(**args)
             logger.info(f"Extracted: destination={extracted.destination}, interests={extracted.interests}")
-            
+
             # 构建状态更新字典
-            updates = {}
-            
+            updates: dict[str, Any] = {}
+
             # 1. 状态感知的目的地逻辑：若已有目的地，新抽取的目的地降级为兴趣
             if extracted.destination:
                 if not state.get("destination"):
@@ -220,19 +313,19 @@ async def extract_info(state: PlannerState, config: RunnableConfig) -> dict:
                         extracted.interests = []
                     if extracted.destination not in extracted.interests:
                         extracted.interests.append(extracted.destination)
-            
+
             # 2. 兴趣累加逻辑：将新抽取的兴趣与已有兴趣合并（去重）
             if extracted.interests:
                 existing_interests = state.get("interests") or []
                 # 用 dict.fromkeys 保持顺序并去重
                 merged_interests = list(dict.fromkeys(existing_interests + extracted.interests))
                 updates["interests"] = merged_interests
-            
+
             return updates
         else:
             logger.warning("LLM 未返回工具调用，尝试解析内容")
             return {}
-            
+
     except Exception as e:
         logger.error(f"抽取失败: {e}")
         return {}
@@ -241,7 +334,7 @@ async def extract_info(state: PlannerState, config: RunnableConfig) -> dict:
 # =============================================================================
 # 节点：询问缺失信息
 # =============================================================================
-def ask_missing_info(state: PlannerState, config: RunnableConfig) -> dict:
+async def ask_missing_info(state: PlannerState, config: RunnableConfig) -> dict:
     """通过 interrupt 动态询问缺失的必填字段。"""
     logger.info(f"--- [ASK MISSING] Remaining steps: {state.get('remaining_steps')} ---")
     missing_fields = get_missing_fields(state)
@@ -257,11 +350,45 @@ def ask_missing_info(state: PlannerState, config: RunnableConfig) -> dict:
     
     # 通过 interrupt 获取用户输入
     user_response = interrupt(combined_prompt)
-    logger.info(f"用户回复: {user_response}")
-    
-    return {
-        "messages": [HumanMessage(content=user_response)]
-    }
+    logger.info(f"用户回复摘要: {MultimodalInputProcessor.summarize_content_for_log(user_response)}")
+    update = build_interrupt_text_message_update(user_response)
+    normalized = MultimodalInputProcessor.normalize_human_content(user_response)
+    text_only = normalized.get("current_user_text", "")
+
+    # interrupt 回合若含图，直接在当前节点完成图转文；只把文本写入 state
+    if normalized.get("has_visual_input"):
+        llm = get_model(config["configurable"].get("model", settings.DEFAULT_MODEL))
+        vision_text = await MultimodalInputProcessor.vision_to_text(
+            llm,
+            config,
+            VISION_SYSTEM_PROMPT,
+            user_response,
+            logger=logger,
+            log_prefix="[ASK MISSING 视觉理解]",
+        )
+
+        if text_only and vision_text:
+            merged = f"{text_only}\n\n[图片内容识别]\n{vision_text}"
+        elif vision_text:
+            merged = vision_text
+        else:
+            merged = text_only or ""
+
+        update["extraction_input_text"] = merged
+        if merged:
+            update["messages"] = [HumanMessage(content=merged)]
+        elif "messages" in update:
+            del update["messages"]
+    # 仅图片且图转文失败时，写入哨兵 HumanMessage，避免 normalize_input 回读旧消息
+    update, fallback_applied = MultimodalInputProcessor.apply_interrupt_image_only_fallback(
+        update,
+        has_visual_input=bool(normalized.get("has_visual_input")),
+        fallback_text=INTERRUPT_IMAGE_ONLY_FALLBACK_TEXT,
+    )
+    if fallback_applied:
+        logger.warning("[ASK MISSING] 仅图输入且识别失败，写入哨兵消息并继续追问")
+
+    return update
 
 
 # =============================================================================
@@ -319,6 +446,9 @@ async def create_itinerary(state: PlannerState, config: RunnableConfig) -> dict:
         # 为下一次行程重置
         "destination": None,
         "interests": None,
+        "current_user_text": "",
+        "has_visual_input": False,
+        "extraction_input_text": "",
     }
 
 
@@ -341,12 +471,20 @@ def route_by_completeness(state: PlannerState) -> Literal["complete", "incomplet
 workflow = StateGraph(PlannerState)
 
 # 添加节点
+workflow.add_node("normalize_input", normalize_input)
+workflow.add_node("vision_enrich", vision_enrich)
 workflow.add_node("extract_info", extract_info)
 workflow.add_node("ask_missing", ask_missing_info)
 workflow.add_node("create_itinerary", create_itinerary)
 
-# 设置入口
-workflow.set_entry_point("extract_info")
+# 入口：先规范化当前轮输入，再按多模态路由
+workflow.add_edge(START, "normalize_input")
+workflow.add_conditional_edges(
+    "normalize_input",
+    route_input_modality,
+    {"vision": "vision_enrich", "text": "extract_info"},
+)
+workflow.add_edge("vision_enrich", "extract_info")
 
 # 添加带智能路由的边
 workflow.add_conditional_edges(
@@ -358,8 +496,8 @@ workflow.add_conditional_edges(
     }
 )
 
-# 询问后回到抽取节点以处理新输入
-workflow.add_edge("ask_missing", "extract_info")
+# 询问后重新规范化当前轮输入，再按多模态路由
+workflow.add_edge("ask_missing", "normalize_input")
 
 # 创建行程后结束
 workflow.add_edge("create_itinerary", END)
@@ -367,10 +505,10 @@ workflow.add_edge("create_itinerary", END)
 # 编译图
 simple_travel_planner_agent = workflow.compile().with_config({'recursion_limit': 10})
 
-# try:
-#     graph_obj = simple_travel_planner_agent.get_graph()
-#     pic = graph_obj.draw_mermaid_png()
-#     with open('state_graph_simple_travel_planner.png', 'wb') as f:
-#         f.write(pic)
-# except Exception as e:
-#     logger.warning(f"生成图例失败: {e}")
+try:
+    graph_obj = simple_travel_planner_agent.get_graph()
+    pic = graph_obj.draw_mermaid_png()
+    with open('state_graph_simple_travel_planner.png', 'wb') as f:
+        f.write(pic)
+except Exception as e:
+    logger.warning(f"生成图例失败: {e}")

@@ -41,8 +41,11 @@ class ServiceMetadata(BaseModel):
 class UserInput(BaseModel):
     """Basic user input for the agent."""
 
-    message: str = Field(
-        description="User input to the agent.",
+    message: str | list[Any] = Field(
+        description=(
+            "User input: plain string, or OpenAI-style multimodal blocks "
+            "(e.g. text + image_url) for vision models."
+        ),
         examples=["What is the weather in Tokyo?"],
     )
     model: SerializeAsAny[AllModelEnum] | None = Field(

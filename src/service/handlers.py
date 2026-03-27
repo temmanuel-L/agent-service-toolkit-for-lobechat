@@ -32,7 +32,6 @@ from fastapi.responses import StreamingResponse
 from langchain_core.messages import AIMessage, AIMessageChunk, SystemMessage, HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langfuse import Langfuse, propagate_attributes
-from langfuse.langchain import CallbackHandler
 from langgraph.types import Command, Interrupt
 from langsmith import Client as LangsmithClient
 from langsmith.utils import LangSmithAuthError
@@ -50,6 +49,7 @@ from schema import (
     UserInput,
 )
 from service.utils import convert_message_content_to_string, langchain_to_chat_message, remove_tool_calls
+from service.langfuse_redacting_handler import RedactingLangfuseCallbackHandler
 from .task_manager import _build_stop_chat_message, register_active_task, unregister_active_task
 from memory.utils import is_low_quality_text
 from utils.log_utils import get_logger
@@ -332,7 +332,8 @@ async def _handle_input(
     # 如果启用了Langfuse跟踪，则添加Langfuse回调处理器
     if settings.LANGFUSE_TRACING:
         # Langfuse 回调配置 (全局客户端已在 lifespan.py 中初始化)
-        langfuse_handler = CallbackHandler()
+        # 仅影响 trace 记录：将 image_url 字段截断，避免超大 base64 撑爆 Langfuse 页面
+        langfuse_handler = RedactingLangfuseCallbackHandler(keep_image_url_chars=100)
 
         callbacks.append(langfuse_handler)
 
@@ -375,7 +376,8 @@ async def _handle_input(
         try:
             memory_message = await memory_manager.abuild_system_message(
                 user_id=user_id,
-                query=user_input.message,
+                # 这里仅为长期记忆检索构造文本 query，不会影响传给 agent 图的原始多模态消息结构。
+                query=convert_message_content_to_string(user_input.message),
             )
             logger.info(
                 "长期记忆注入完成: user_id=%s has_memory=%s elapsed_ms=%.2f",
@@ -393,8 +395,10 @@ async def _handle_input(
 
     # 根据是否存在中断任务决定输入数据的格式
     if is_interrupted:
-        # 假设用户输入是用于从中断处恢复agent执行的响应
-        input_data: Command[Any] | dict[str, Any] = Command(resume=user_input.message)
+        # 中断恢复时保持原始消息结构，确保多模态 list 不会被提前压平成纯文本。
+        # 这样 planner/chatbot 等 agent 都能在图内用统一逻辑处理本轮输入。
+        resume_payload: str | list[Any] = user_input.message
+        input_data: Command[Any] | dict[str, Any] = Command(resume=resume_payload)
     else:
         # 正常情况下将用户消息包装成HumanMessage
         messages = [HumanMessage(content=user_input.message)]
@@ -470,7 +474,8 @@ async def invoke_handler(user_input: UserInput, agent_id: str = DEFAULT_AGENT) -
                 await memory_manager.arecord_turn(
                     user_id=user_id,
                     thread_id=thread_id,
-                    user_message=user_input.message,
+                    # 长期记忆只存文本，不存 image_url 等多模态块；agent 图里处理的仍是原始 message。
+                    user_message=convert_message_content_to_string(user_input.message),
                     assistant_message=str(output.content),
                     config=kwargs.get("config"),
                 )
@@ -603,6 +608,7 @@ async def message_generator(
                     if not content:
                         continue
                     
+                    # token 流输出给前端前需要文本化；这一步针对模型返回 chunk，不影响用户输入如何进入 agent 图。
                     chunk_str = convert_message_content_to_string(content)
                     if not chunk_str:
                         continue
@@ -693,7 +699,10 @@ async def message_generator(
                             continue
                         
                         # LangGraph 会重新发送输入消息，这感觉很奇怪，所以丢弃它
-                        if chat_message.type == "human" and (chat_message.content or "").strip() == (user_input.message or "").strip():
+                        # 这里用“文本化后的用户输入”做比较，仅用于去重显示，不会改写 state 中原始 HumanMessage.content。
+                        if chat_message.type == "human" and (chat_message.content or "").strip() == (
+                            convert_message_content_to_string(user_input.message) if user_input.message else ""
+                        ).strip():
                             continue
                         
                         # 保留逻辑：如果标记了跳过流式传输，则不发送
@@ -759,7 +768,8 @@ async def message_generator(
                     await memory_manager.arecord_turn(
                         user_id=user_id,
                         thread_id=thread_id,
-                        user_message=user_input.message,
+                        # 流式结束后的记忆回写同样只保留文本内容，和 resume/agent 图中的原始多模态载荷解耦。
+                        user_message=convert_message_content_to_string(user_input.message),
                         assistant_message=assistant_content,
                         config=kwargs.get("config"),
                     )

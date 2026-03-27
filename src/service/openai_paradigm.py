@@ -21,6 +21,7 @@ from typing import AsyncGenerator
 from fastapi import HTTPException, Request
 from fastapi.responses import StreamingResponse
 
+from agents.multimodal_input_processor import MultimodalInputProcessor
 from schema import (OpenAIChatCompletionRequest, StreamInput,
                     OpenAIChatMessage, OpenAIChoice, OpenAIChatCompletionResponse,
                     OpenAIChatStreamDelta, OpenAIStreamChoice, OpenAIChatCompletionStreamResponse)
@@ -47,7 +48,7 @@ async def chat_completions_handler(
     """
     if request.messages:
         last_message = request.messages[-1]
-        user_message = last_message.get("content", "")
+        user_message = MultimodalInputProcessor.normalize_openai_user_content(last_message.get("content", ""))
         user_id = user_id or request.user or "default_user"
     else:
         user_message = ""
