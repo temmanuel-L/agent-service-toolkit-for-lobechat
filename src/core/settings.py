@@ -274,8 +274,8 @@ class Settings(BaseSettings):
 
     def model_post_init(self, __context: Any) -> None:
         api_keys = {
-            Provider.OPENAI_COMPATIBLE: self.COMPATIBLE_API_KEY,
             Provider.OLLAMA: self.OLLAMA_MODEL and is_ollama_reachable(self.OLLAMA_BASE_URL),
+            Provider.OPENAI_COMPATIBLE: self.COMPATIBLE_API_KEY,
             Provider.ZHIPU: self.ZHIPU_API_KEY,
             Provider.OPENAI: self.OPENAI_API_KEY,
             Provider.DEEPSEEK: self.DEEPSEEK_API_KEY,

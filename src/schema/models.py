@@ -89,8 +89,8 @@ class OllamaModelName(StrEnum):
 
     # OLLAMA_GENERIC = "alibayram/Qwen3-30B-A3B-Instruct-2507:latest"
     # OLLAMA_GENERIC = "qwen3:30b-a3b-instruct-16k"
-    OLLAMA_GENERIC = "ministral-3:3b"
-    # OLLAMA_GENERIC = "frob/qwen3.5-instruct:9b"
+    # OLLAMA_GENERIC = "ministral-3:3b"
+    OLLAMA_GENERIC = "frob/qwen3.5-instruct:9b"
 
 
 class OpenRouterModelName(StrEnum):

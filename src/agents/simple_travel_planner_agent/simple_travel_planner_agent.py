@@ -505,10 +505,10 @@ workflow.add_edge("create_itinerary", END)
 # 编译图
 simple_travel_planner_agent = workflow.compile().with_config({'recursion_limit': 10})
 
-try:
-    graph_obj = simple_travel_planner_agent.get_graph()
-    pic = graph_obj.draw_mermaid_png()
-    with open('state_graph_simple_travel_planner.png', 'wb') as f:
-        f.write(pic)
-except Exception as e:
-    logger.warning(f"生成图例失败: {e}")
+# try:
+#     graph_obj = simple_travel_planner_agent.get_graph()
+#     pic = graph_obj.draw_mermaid_png()
+#     with open('state_graph_simple_travel_planner.png', 'wb') as f:
+#         f.write(pic)
+# except Exception as e:
+#     logger.warning(f"生成图例失败: {e}")
