@@ -231,7 +231,7 @@ async def vision_enrich(state: PlannerState, config: RunnableConfig) -> dict:
         logger=logger,
         log_prefix="[视觉理解]",
     )
-    logger.info(f"[视觉理解] 模型输出内容: {vision_text[:2000]!r}")
+    logger.info(f"[视觉理解] 模型输出内容: {vision_text[:200]!r}")
 
     if user_text and vision_text:
         merged = f"{user_text}\n\n[图片内容识别]\n{vision_text}"
@@ -243,7 +243,7 @@ async def vision_enrich(state: PlannerState, config: RunnableConfig) -> dict:
     if not merged:
         logger.warning("[视觉理解] 合并结果为空，仍进入抽取（可能无有效信息）")
     else:
-        logger.info(f"[视觉理解] 写入 extraction_input_text: {merged[:2500]!r}")
+        logger.info(f"[视觉理解] 写入 extraction_input_text: {merged[:300]!r}")
 
     return {"extraction_input_text": merged}
 
@@ -270,10 +270,10 @@ async def extract_info(state: PlannerState, config: RunnableConfig) -> dict:
         ("human", "{user_message}"),
     ])
     logger.info(f"[抽取信息] extraction_input_text 长度: {len(extraction_input_text)}")
-    logger.info(f"[抽取信息] extraction_input_text 内容: {extraction_input_text[:2500]!r}")
+    logger.info(f"[抽取信息] extraction_input_text 内容: {extraction_input_text[:300]!r}")
     if "[图片内容识别]" in extraction_input_text:
         vision_section = extraction_input_text.split("[图片内容识别]", 1)[1].strip()
-        logger.info(f"[抽取信息] 图片识别片段: {vision_section[:2000]!r}")
+        logger.info(f"[抽取信息] 图片识别片段: {vision_section[:200]!r}")
 
     try:
         # Invoke LLM with tool calling - include few-shot examples
