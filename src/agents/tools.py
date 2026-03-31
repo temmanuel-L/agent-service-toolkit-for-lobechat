@@ -63,13 +63,19 @@ class FormattedDuckDuckGoSearchResults(DuckDuckGoSearchResults):
 
     name: str = "WebSearch"
 
+    def _format_tool_return(self, text: str, raw_results: list | None = None) -> str | tuple:
+        """在 ``response_format='content_and_artifact'`` 时统一返回 (content, artifact)，避免 invoke/run 校验失败。"""
+        if getattr(self, "response_format", None) == "content_and_artifact":
+            return text, raw_results or []
+        return text
+
     def _run(self, query: str, run_manager=None) -> str | tuple:
         """执行网页搜索工具（单次请求），并返回 Markdown 格式结果。"""
         # 单次 api_wrapper.results = 单次网络请求，返回最多 max_results 条；后续仅内存内 BM25/去重/截断
         try:
             results = self.api_wrapper.results(query, self.max_results)
             if not results:
-                return "未找到相关结果。"
+                return self._format_tool_return("未找到相关结果。")
 
             max_out = settings.DDGS_MAX_RESULTS
             top_k = settings.DDGS_TOP_K
@@ -83,7 +89,9 @@ class FormattedDuckDuckGoSearchResults(DuckDuckGoSearchResults):
             picked = self._filter_and_rank(dedup, top_k=top_k, min_score=min_score)
             # 若全部低于 min_score（如 API 返回无关内容、多引擎超时后的脏数据），不再回退到低相关结果，避免返回与问题无关的条目
             if not picked:
-                return "未找到与您问题相关的结果，建议更换关键词或稍后重试。"
+                return self._format_tool_return(
+                    "未找到与您问题相关的结果，建议更换关键词或稍后重试。"
+                )
 
             results = picked[:max(1, max_out)]
 
@@ -98,11 +106,7 @@ class FormattedDuckDuckGoSearchResults(DuckDuckGoSearchResults):
 
             formatted_res = "\n\n".join(formatted_results)
 
-            # 兼容 content_and_artifact 格式（lobe-chat）
-            if getattr(self, "response_format", None) == "content_and_artifact":
-                return formatted_res, results
-
-            return formatted_res
+            return self._format_tool_return(formatted_res, results)
         except Exception:
             # 若出错，回退到默认行为
             return super()._run(query, run_manager)
@@ -115,7 +119,7 @@ class FormattedDuckDuckGoSearchResults(DuckDuckGoSearchResults):
                 timeout=settings.DDGS_TIMEOUT,
             )
         except asyncio.TimeoutError:
-            return "网络搜索超时，请稍后重试或换一种问法。"
+            return self._format_tool_return("网络搜索超时，请稍后重试或换一种问法。")
 
     def _tokenize_list(self, text: str) -> list[str]:
         if not text:

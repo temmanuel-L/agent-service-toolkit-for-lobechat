@@ -1,6 +1,8 @@
-# multi_agent_travel_helper — 设计说明（实施前）
+# multi_agent_travel_helper — 设计说明
 
-> 本文档为 `multi_agent_travel_helper` 智能体的架构与状态机设计，与 [simple_travel_planner_agent](../simple_travel_planner_agent/simple_travel_planner_agent.py) 隔离实现。
+> 架构与状态机设计见下文。**实现**已落地：`multi_agent_travel_helper_agent.py`、`workers.py`、`pref.db`（SQLite，已加入仓库根 `.gitignore`）、注册名 **`multi-agent-travel-helper`**。**检索拓扑**：`supervisor` → `research_fanout` → **六条边**至各 `worker_*`，再 **fan-in** 至 `mobility_budget`；`research` 使用 **浅合并 reducer**。**定价不通过**时走 `rerun_workers`（`parse_pricing_rerun_targets` + `rerun_selected_workers`），仅重跑相关子块而非六路全量。**对齐**：`mobility_align_and_budget` 按 `trip_start_date`+天数窗口过滤 `hotels`/`food`/`tickets`/`transport` 的 `line_items` 并刷新小计与 `alignment_report`。**结构化**：worker 侧优先解析 Markdown 的 **json 代码围栏**内数组。兼容用 `run_all_workers_parallel` 仍可在单节点内 `gather` 六路。
+
+与 [simple_travel_planner_agent](../simple_travel_planner_agent/simple_travel_planner_agent.py) 隔离实现。
 
 ---
 

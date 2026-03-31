@@ -15,6 +15,7 @@ from agents.lazy_agent import LazyLoadingAgent
 from agents.rag_assistant.rag_assistant import rag_assistant
 from agents.research_assistant.research_assistant import research_assistant
 from agents.simple_travel_planner_agent.simple_travel_planner_agent import simple_travel_planner_agent
+from agents.multi_agent_travel_helper.multi_agent_travel_helper_agent import multi_agent_travel_helper_agent
 from agents.music_composer.music_composer import music_composer_agent
 from agents.multi_agent_medical_assistant import multi_agent_medical_assistant
 from agents.parallelization.parallelization_agent import parallelization_agent
@@ -68,6 +69,10 @@ agents: dict[str, Agent] = {
     "simple-travel-planner": Agent(
         description="A simple travel planner assistant with structured data gathering.",
         graph_like=simple_travel_planner_agent,
+    ),
+    "multi-agent-travel-helper": Agent(
+        description="Multi-agent travel helper: multimodal intake, SQLite price prefs, parallel web research, pricing HITL.",
+        graph_like=multi_agent_travel_helper_agent,
     ),
     "music-composer": Agent(
         description="An AI music composer that generates MIDI files based on style, mood, and key.",

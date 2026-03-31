@@ -397,9 +397,10 @@ async def ask_missing_info(state: PlannerState, config: RunnableConfig) -> dict:
 itinerary_prompt = ChatPromptTemplate.from_messages([
     ("system", 
      "你是一位专业的旅行规划师。今天的日期是 {date}。\n"
-     "请为用户创建一份详细的 {destination} 旅游行程。用户的兴趣是：{interests}。\n"
-     "请以 Markdown 格式输出，包含时间、地点、活动和建议。\n"
-     "如果景点较多，可以安排多日行程。"),
+     "请为用户创建一份**内容充实**的 {destination} 旅游行程（Markdown）。用户的兴趣是：{interests}。\n"
+     "要求：按天分节，每天至少写上午/下午/晚间三块，每块多句具体安排；"
+     "另含交通、餐饮、预算估算、注意事项等独立小节；勿用寥寥数段概括敷衍。\n"
+     "若兴趣点较多，合理拆成多日并写明动线。"),
     ("human", "请为我规划行程。"),
 ])
 

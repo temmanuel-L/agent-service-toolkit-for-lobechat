@@ -2,12 +2,7 @@
     "python_version": "3.12",
     "dependencies": ["./src"],
     "graphs": {
-        "research_assistant": "./src/agents/research_assistant.py:research_assistant"
-    },
-    "env": "./.env",
-    "commands": {
-        "before": [
-            "uv run research_assistant"
-        ]
+        "research_assistant": "./src/agents/research_assistant/research_assistant.py:research_assistant",
+        "multi_agent_travel_helper": "./src/agents/multi_agent_travel_helper/multi_agent_travel_helper_agent.py:multi_agent_travel_helper_agent"
     }
 }
