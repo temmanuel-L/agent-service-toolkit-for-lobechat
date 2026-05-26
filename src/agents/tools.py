@@ -1,10 +1,12 @@
 from typing import Optional
 import asyncio
+import os
 import numexpr
 import math
 import re
 
 from langchain_community.tools import DuckDuckGoSearchResults
+from langchain_community.tools.tavily_search.tool import TavilyInput, TavilySearchResults
 from langchain_core.tools import BaseTool, tool
 from pydantic import BaseModel, Field
 
@@ -206,6 +208,112 @@ class FormattedDuckDuckGoSearchResults(DuckDuckGoSearchResults):
 
 
 web_search = FormattedDuckDuckGoSearchResults(max_results=settings.DDGS_MAX_RESULTS)
+
+
+def _resolve_tavily_api_key() -> str | None:
+    if settings.TAVILY_API_KEY:
+        v = settings.TAVILY_API_KEY.get_secret_value()
+        if v and str(v).strip():
+            return str(v).strip()
+    env_v = (os.environ.get("TAVILY_API_KEY") or "").strip()
+    return env_v or None
+
+
+class FormattedTavilySearchResults(TavilySearchResults):
+    """
+    基于 LangChain ``TavilySearchResults`` 的网页搜索，输出与 DDG 工具一致的 Markdown 片段格式。
+
+    条数、搜索深度与超时从 ``core.settings`` 读取（``.env`` 中 ``TAVILY_*``）。
+    ``name`` 仍为 ``WebSearch``，便于子智能体沿用同一工具调用约定。
+    """
+
+    name: str = "WebSearch"
+    description: str = (
+        "A search engine optimized for comprehensive, accurate, and trusted results. "
+        "Useful for when you need to answer questions about current events. "
+        "Input should be a search query."
+    )
+    include_answer: bool = False
+    include_raw_content: bool = False
+    include_images: bool = False
+
+    def _format_tool_return(self, text: str, raw_results: list | None = None) -> str | tuple:
+        if getattr(self, "response_format", None) == "content_and_artifact":
+            return text, raw_results or []
+        return text
+
+    def _run(self, query: str, run_manager=None) -> str | tuple:
+        q = (query or "").strip()
+        if not q:
+            return self._format_tool_return("未找到相关结果。")
+        try:
+            raw = self.api_wrapper.raw_results(
+                q,
+                self.max_results,
+                self.search_depth,
+                self.include_domains,
+                self.exclude_domains,
+                self.include_answer,
+                self.include_raw_content,
+                self.include_images,
+            )
+        except Exception as e:
+            return self._format_tool_return(f"Tavily 检索失败: {e}")
+        results_list = raw.get("results") or []
+        if not results_list:
+            return self._format_tool_return("未找到相关结果。")
+        cleaned = self.api_wrapper.clean_results(results_list)
+        if not cleaned:
+            return self._format_tool_return("未找到相关结果。")
+        formatted_results = []
+        for res in cleaned:
+            title = res.get("title", "No Title")
+            link = res.get("url", "")
+            snippet = res.get("content", "")
+            formatted_results.append(f"### [{title}]({link})\n> {snippet}")
+        formatted_res = "\n\n".join(formatted_results)
+        return self._format_tool_return(formatted_res, cleaned)
+
+    async def _arun(self, query: str, run_manager=None) -> str | tuple:
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(self._run, query, run_manager),
+                timeout=settings.TAVILY_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            return self._format_tool_return("网络搜索超时，请稍后重试或换一种问法。")
+
+
+class _TavilyKeyMissingWebSearch(BaseTool):
+    """未配置 ``TAVILY_API_KEY`` 时的占位工具，避免 import 阶段崩溃。"""
+
+    name: str = "WebSearch"
+    description: str = (
+        "A search engine optimized for comprehensive, accurate, and trusted results. "
+        "Useful for when you need to answer questions about current events. "
+        "Input should be a search query."
+    )
+    args_schema: type[BaseModel] = TavilyInput
+
+    def _run(self, query: str, run_manager=None) -> str:
+        return (
+            "未配置 TAVILY_API_KEY，无法使用 Tavily 联网检索。"
+            "请在环境变量或 .env 中设置 TAVILY_API_KEY 后重启服务。"
+        )
+
+    async def _arun(self, query: str, run_manager=None) -> str:
+        return self._run(query, run_manager)
+
+
+_tavily_key = _resolve_tavily_api_key()
+if _tavily_key:
+    tavily_search: BaseTool = FormattedTavilySearchResults(
+        tavily_api_key=_tavily_key,
+        max_results=settings.TAVILY_MAX_RESULTS,
+        search_depth=settings.TAVILY_SEARCH_DEPTH,
+    )
+else:
+    tavily_search = _TavilyKeyMissingWebSearch()
 
 
 class VectorSearchInput(BaseModel):

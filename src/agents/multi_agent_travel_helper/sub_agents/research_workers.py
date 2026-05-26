@@ -4,7 +4,7 @@
 
 每个 worker 的标准模式
 --------------------
-1. 根据 state 拼搜索 query；与 ``research_assistant`` 一致，对主模型 ``bind_tools([web_search])`` 后
+1. 根据 state 拼搜索 query；对子模型 ``bind_tools([tavily_search])`` 后
    ``ainvoke``，由模型发起 ``WebSearch`` 工具调用，再执行工具得到摘要（若未出 tool call 则回退直连 ``invoke``）。
 2. 将检索摘要截断后塞进 LLM；要求模型输出「简短叙事 + JSON 数组 line_items」
    （文化 worker 仅叙事，line_items 固定为空）。
@@ -32,7 +32,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 
 from agents.multi_agent_travel_helper.multi_agent_travel_helper_agent import SUB_AGENT_MODEL
-from agents.tools import web_search
+from agents.tools import tavily_search
 from agents.utils import get_silent_config
 from core import get_model
 from utils.log_utils import get_logger
@@ -67,13 +67,13 @@ def _normalize_tool_call(tc: Any) -> dict[str, Any]:
     return {"name": name, "args": args}
 
 
-def _execute_web_search(query: str) -> str:
-    """同步执行网页搜索。直接调用 ``_run``，绕过 ``invoke``/``run`` 在 content_and_artifact 下的严格元组校验。"""
+def _execute_tavily_search(query: str) -> str:
+    """同步执行 Tavily 网页搜索。直接调用 ``_run``，绕过 ``invoke``/``run`` 在 content_and_artifact 下的严格元组校验。"""
     q = (query or "").strip() or "旅行"
     try:
-        raw = web_search._run(q)
+        raw = tavily_search._run(q)
     except Exception as exc:
-        logger.warning("web_search._run failed: %s", exc)
+        logger.warning("tavily_search._run failed: %s", exc)
         return f"检索失败: {exc}"
     if isinstance(raw, tuple):
         raw = raw[0]
@@ -97,10 +97,10 @@ def _tool_args_from_call(tc: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _web(query: str, config: RunnableConfig) -> str:
-    """先 ``get_model(...).bind_tools([web_search]).ainvoke``，再执行模型选择的 WebSearch；失败时回退直连工具。"""
+    """先 ``get_model(...).bind_tools([tavily_search]).ainvoke``，再执行模型选择的 WebSearch；失败时回退直连工具。"""
     sub = get_silent_config(config)
     llm = get_model(config["configurable"].get("model", SUB_AGENT_MODEL))
-    bound = llm.bind_tools([web_search])
+    bound = llm.bind_tools([tavily_search])
     try:
         ai = await bound.ainvoke(
             [
@@ -117,21 +117,21 @@ async def _web(query: str, config: RunnableConfig) -> str:
         for tc_raw in ai.tool_calls:
             tc = _normalize_tool_call(tc_raw)
             name = tc.get("name")
-            if name != web_search.name:
+            if name != tavily_search.name:
                 continue
             args = _tool_args_from_call(tc)
             q = (args.get("query") or query).strip()
             if not q:
                 q = query
             try:
-                return await asyncio.to_thread(_execute_web_search, q)
+                return await asyncio.to_thread(_execute_tavily_search, q)
             except Exception as exc:
                 logger.warning("WebSearch tool run failed: %s", exc)
                 return f"检索失败: {exc}"
         logger.warning("[research_workers] tool_calls without WebSearch, fallback direct run")
 
     try:
-        return await asyncio.to_thread(_execute_web_search, query.strip() or "旅行")
+        return await asyncio.to_thread(_execute_tavily_search, query.strip() or "旅行")
     except Exception as exc:
         logger.warning("WebSearch fallback run failed: %s", exc)
         return f"检索失败: {exc}"

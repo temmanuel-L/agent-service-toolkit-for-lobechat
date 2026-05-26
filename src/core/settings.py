@@ -268,6 +268,12 @@ class Settings(BaseSettings):
     DDGS_BM25_K1: float = 1.5          # BM25 参数 k1
     DDGS_BM25_B: float = 0.75          # BM25 参数 b
 
+    # Tavily 网页搜索（FormattedTavilySearchResults；multi_agent_travel_helper 子智能体默认使用）
+    TAVILY_API_KEY: SecretStr | None = None
+    TAVILY_MAX_RESULTS: int = 5
+    TAVILY_TIMEOUT: float = 20.0       # 单次 WebSearch 调用总超时（秒）
+    TAVILY_SEARCH_DEPTH: str = "basic"  # basic 较快；advanced 更深、更慢、更耗配额
+
     # 数据清理配置
     CLEANUP_INTERVAL_HOURS: int = 24  # 清理间隔，单位：小时
     DATA_RETENTION_DAYS: int = 30     # 数据保留天数
@@ -276,9 +282,9 @@ class Settings(BaseSettings):
         api_keys = {
             Provider.OLLAMA: self.OLLAMA_MODEL and is_ollama_reachable(self.OLLAMA_BASE_URL),
             Provider.OPENAI_COMPATIBLE: self.COMPATIBLE_API_KEY,
+            Provider.DEEPSEEK: self.DEEPSEEK_API_KEY,
             Provider.ZHIPU: self.ZHIPU_API_KEY,
             Provider.OPENAI: self.OPENAI_API_KEY,
-            Provider.DEEPSEEK: self.DEEPSEEK_API_KEY,
             Provider.ANTHROPIC: self.ANTHROPIC_API_KEY,
             Provider.GOOGLE: self.GOOGLE_API_KEY,
             Provider.VERTEXAI: self.GOOGLE_APPLICATION_CREDENTIALS,

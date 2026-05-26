@@ -36,7 +36,8 @@ class AzureOpenAIModelName(StrEnum):
 class DeepseekModelName(StrEnum):
     """https://api-docs.deepseek.com/quick_start/pricing"""
 
-    DEEPSEEK_CHAT = "deepseek-chat"
+    # DEEPSEEK_CHAT = "deepseek-v4-flash"
+    DEEPSEEK_CHAT = "deepseek-v4-pro"
 
 
 class AnthropicModelName(StrEnum):

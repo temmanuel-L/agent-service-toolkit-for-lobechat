@@ -144,49 +144,89 @@
 
 ## 7. 图结构（Mermaid）
 
+与 `multi_agent_travel_helper_agent.py` 中 `workflow.add_*` 注册一致（2026-05 对齐实现）。
+
 ```mermaid
 flowchart TB
-  START([START]) --> hydrate[hydrate_price_preferences_from_db]
-  hydrate --> normalize_input[normalize_input]
-  normalize_input --> modality{route_modality}
-  modality -->|vision| vision_enrich[vision_enrich]
-  modality -->|text| extract_info[extract_info]
-  vision_enrich --> extract_info
-  extract_info --> collect{soft_ask_or_defaults}
-  collect -->|round_lt_max_and_gaps| ask_missing[ask_missing]
-  ask_missing --> normalize_input
-  collect -->|else| apply_def[apply_intake_defaults]
-  apply_def --> render_in[render_intake_confirmation]
-  render_in --> int_in[[interrupt_intake_summary]]
-  int_in --> parse_in[parse_intake_confirmation]
-  parse_in --> in_ok{intake_agreed_and_valid}
-  in_ok -->|no| normalize_input
-  in_ok -->|yes| persist[persist_price_preferences_to_db]
-  persist --> supervisor[supervisor_dispatch]
-  supervisor --> fanout[[parallel_SixWorkers]]
-  fanout --> w1[weather_worker]
-  fanout --> w2[transport_worker]
-  fanout --> w3[hotel_worker]
-  fanout --> w4[food_worker]
-  fanout --> w5[culture_worker]
-  fanout --> w6[ticket_worker]
-  w1 --> merge[merge_research]
-  w2 --> merge
-  w3 --> merge
-  w4 --> merge
-  w5 --> merge
-  w6 --> merge
-  merge --> mob[build_mobility_timeline]
-  mob --> align[alignment_reconcile]
-  align --> budget_agg[budget_aggregate]
-  budget_agg --> render_md[render_pricing_confirmation]
-  render_md --> hitl[[interrupt_user_confirm]]
-  hitl --> parse[parse_pricing_feedback]
-  parse --> ok{approved}
-  ok -->|no| rerun[partial_rerun_workers]
-  rerun --> merge
-  ok -->|yes| compose[compose_itinerary]
+  START([START]) --> hydrate["hydrate_prefs<br/>SQLite 偏好水合"]
+
+  subgraph intake ["Intake：多模态采集与确认"]
+    direction TB
+    normalize["normalize_input<br/>解析文本/是否含图"]
+    modality{"route_input_modality"}
+    vision["vision_enrich<br/>Vision 识图 → 合并配文"]
+    extract["extract_info<br/>Tool Calling 结构化抽取"]
+    collect{"route_intake_collect<br/>缺字段且未超轮次?"}
+    ask["ask_missing<br/>interrupt 追问"]
+    defaults["apply_intake_defaults<br/>幂等默认值"]
+    confirm["intake_user_confirm<br/>interrupt 摘要确认"]
+    after_in{"route_after_intake<br/>intake_confirmed?"}
+    persist["persist_prefs<br/>SQLite UPSERT 偏好"]
+  end
+
+  hydrate --> normalize
+  normalize --> modality
+  modality -->|含图| vision
+  modality -->|纯文本| extract
+  vision --> extract
+  extract --> collect
+  collect -->|ask| ask
+  ask --> normalize
+  collect -->|proceed| defaults
+  defaults --> confirm
+  confirm --> after_in
+  after_in -->|retry| normalize
+  after_in -->|persist| persist
+
+  subgraph research ["Research：六路并行检索 Fan-out / Fan-in"]
+    direction TB
+    supervisor["supervisor_dispatch"]
+    fanout["research_fanout<br/>分叉锚点（无状态变更）"]
+    w_weather["worker_weather"]
+    w_transport["worker_transport"]
+    w_hotel["worker_hotel"]
+    w_food["worker_food"]
+    w_culture["worker_culture"]
+    w_ticket["worker_ticket"]
+    merge_hint["merge_research reducer<br/>并行结果浅合并"]
+    mobility["mobility_align_and_budget<br/>归桶 · 日期窗口 · 预算汇总"]
+  end
+
+  persist --> supervisor
+  supervisor --> fanout
+  fanout --> w_weather
+  fanout --> w_transport
+  fanout --> w_hotel
+  fanout --> w_food
+  fanout --> w_culture
+  fanout --> w_ticket
+  w_weather --> merge_hint
+  w_transport --> merge_hint
+  w_hotel --> merge_hint
+  w_food --> merge_hint
+  w_culture --> merge_hint
+  w_ticket --> merge_hint
+  merge_hint --> mobility
+
+  subgraph pricing ["Pricing HITL：报价确认与局部重跑"]
+    direction TB
+    price_confirm["pricing_user_confirm<br/>interrupt 四表报价 MD"]
+    price_route{"route_pricing_ok<br/>pricing_user_ok?"}
+    rerun["rerun_workers<br/>parse 反馈 → 局部重跑 worker"]
+    compose["compose_itinerary<br/>合成行程 + checkpoint 重置"]
+  end
+
+  mobility --> price_confirm
+  price_confirm --> price_route
+  price_route -->|rerun| rerun
+  rerun --> mobility
+  price_route -->|compose| compose
   compose --> END([END])
+
+  classDef hitl fill:#fff3cd,stroke:#856404
+  classDef parallel fill:#e7f3ff,stroke:#0d6efd
+  class ask,confirm,price_confirm hitl
+  class w_weather,w_transport,w_hotel,w_food,w_culture,w_ticket parallel
 ```
 
 ---

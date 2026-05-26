@@ -1450,3 +1450,11 @@ workflow.add_edge("compose", END)
 
 # recursion_limit：interrupt 恢复、多轮追问与定价重跑会消耗步数，60 为经验安全余量
 multi_agent_travel_helper_agent = workflow.compile().with_config({"recursion_limit": 60})
+
+# try:
+#     graph_obj = multi_agent_travel_helper_agent.get_graph()
+#     pic = graph_obj.draw_mermaid_png()
+#     with open('multi_agent_travel_helper_agent.png', 'wb') as f:
+#         f.write(pic)
+# except Exception as e:
+#     logger.warning(f"生成图例失败: {e}")
