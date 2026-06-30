@@ -19,6 +19,7 @@ from agents.multi_agent_travel_helper.multi_agent_travel_helper_agent import mul
 from agents.music_composer.music_composer import music_composer_agent
 from agents.multi_agent_medical_assistant import multi_agent_medical_assistant
 from agents.parallelization.parallelization_agent import parallelization_agent
+from agents.graph_rag_agent.graph_rag_agent import graph_rag_agent
 from schema import AgentInfo
 
 DEFAULT_AGENT = "chatbot"
@@ -85,6 +86,10 @@ agents: dict[str, Agent] = {
     "multi-agent-medical-assistant": Agent(
         description="Medical multi-agent assistant with RAG, image analysis, and web search.",
         graph_like=multi_agent_medical_assistant,
+    ),
+    "graph-rag-agent": Agent(
+        description="Graph RAG agent with Neo4j VectorCypherRetriever and Text2CypherRetriever.",
+        graph_like=graph_rag_agent,
     ),
 }
 

@@ -1,0 +1,6 @@
+[
+  {
+    "intention": "为我介绍Netapp的投资者,以及他们投资的具体情况",
+    "statement": "MATCH (node)-[:PART_OF]->(form:Form),\n      (form)<-[:FILED]-(company:Company)\n\nCALL {\n    WITH company\n    MATCH (company)<-[owns:OWNS_STOCK_IN]-(manager:Manager)\n    WITH manager.managerName AS managerName, owns.shares AS shares, owns.value AS value\n    ORDER BY shares DESC\n    LIMIT 10\n    RETURN collect(managerName) AS managers,\n           collect(shares) AS sharesList,\n           collect(value) AS valuesList\n}\n\nRETURN \n    node.text AS text,\n    score AS similarityScore,\n    company.companyName AS companyName,\n    managers,\n    sharesList,\n    valuesList,\n    {\n        source: node.source,\n        formId: form.formId,\n        f10kItem: form.f10kItem\n    } AS metadata"
+  }
+]

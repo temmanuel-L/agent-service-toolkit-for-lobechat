@@ -31,6 +31,6 @@ for _logger_name in _noisy_loggers:
     logging.getLogger(_logger_name).setLevel(_min_level)
 
 # Now import other modules
-from core.llm import get_model, get_embedding_model
+from core.llm import get_model, get_embedding_model, get_model_for_neo4j_graphrag
 
-__all__ = ["settings", "get_model", "get_embedding_model"]
+__all__ = ["settings", "get_model", "get_embedding_model", "get_model_for_neo4j_graphrag"]

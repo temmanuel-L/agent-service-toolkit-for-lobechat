@@ -46,16 +46,16 @@ dependencies = [
     "pandas ~=2.2.3",
     "psycopg[binary,pool] ~=3.2.4",
     "pyarrow >=18.1.0",
-    "pydantic ~=2.10.1",
+    "pydantic >=2.11.5",
     "pydantic-settings ~=2.12.0",
-    "pypdf ~=5.3.0",
+    "pypdf >=6.0.0",
     "pyowm ~=3.3.0",
     "python-dotenv ~=1.0.1",
     "qdrant-client ~=1.15.1",
     "langchain-qdrant ~=1.1.0",
     "neo4j ~=6.2.0",
-    "neo4j-graphrag ~=1.17.0",
-    "setuptools ~=75.6.0",
+    "neo4j-graphrag >=1.17.0",
+    "setuptools >=80.9.0",
     "scikit-learn>=1.6.0",
     "streamlit ~=1.46.0",
     "tiktoken >=0.8.0",
@@ -64,12 +64,12 @@ dependencies = [
     "ddgs>=9.9.1",
     "concurrent-log>=1.0.1",
     "music21>=9.9.1",
-    "llama-index-core ~= 0.12.0",
-    "llama-index-vector-stores-qdrant ~= 0.4.0",
-    "llama-index-readers-file ~= 0.4.0",
-    "llama-index-llms-openai ~= 0.3.0",
-    "llama-index-embeddings-langchain ~= 0.3.0",
-    "llama-index-retrievers-bm25 ~= 0.5.0",
+    "llama-index-core >=0.13.0",
+    "llama-index-vector-stores-qdrant >=0.5.0",
+    "llama-index-readers-file >=0.5.0",
+    "llama-index-llms-openai >=0.4.0",
+    "llama-index-embeddings-langchain >=0.4.0",
+    "llama-index-retrievers-bm25 >=0.6.0",
     "python-multipart ~= 0.0.12"
 ]
 
@@ -90,7 +90,7 @@ dev = [
 # To install run: `uv sync --frozen --only-group client`
 client = [
     "httpx~=0.28.0",
-    "pydantic ~=2.10.1",
+    "pydantic >=2.11.5",
     "python-dotenv ~=1.0.1",
     "streamlit~=1.46.0",
 ]
@@ -122,8 +122,8 @@ module = ["langchain_mcp_adapters.*"]
 ignore_missing_imports = true
 
 [project.optional-dependencies]
-pdf-docling = [
-    "docling[vlm]>=2.31.0",
-    "docling-core>=2.28.0",
-    "docling-parse>=4.0.0",
-]
+#pdf-docling = [
+#    "docling[vlm]>=2.31.0",
+#    "docling-core>=2.28.0",
+#    "docling-parse>=4.0.0",
+#]

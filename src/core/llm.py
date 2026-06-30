@@ -9,6 +9,7 @@ from langchain_google_vertexai import ChatVertexAI
 from langchain_groq import ChatGroq
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_openai import AzureChatOpenAI, ChatOpenAI, OpenAIEmbeddings
+from langchain_core.runnables.fallbacks import RunnableWithFallbacks
 
 from core.rerank_api import RerankAPIPostprocessor
 from utils.log_utils import get_logger
@@ -190,6 +191,18 @@ def get_model(model_name: AllModelEnum, /) -> ModelT:
         return FakeToolModel(responses=["This is a test response from the fake model."])
 
     raise ValueError(f"Unsupported model: {model_name}")
+
+
+def get_model_for_neo4j_graphrag(model_name: AllModelEnum, /) -> Any:
+    """获取 LLM 实例，专门用于 neo4j_graphrag（GraphRAG / Retriever）。
+
+    neo4j_graphrag 目前不支持 RunnableWithFallbacks，因此如果 get_model 返回带
+    fallback 的模型，则自动解包返回原始模型。
+    """
+    model = get_model(model_name)
+    if isinstance(model, RunnableWithFallbacks):
+        return next(iter(model.runnables))
+    return model
 
 
 @cache

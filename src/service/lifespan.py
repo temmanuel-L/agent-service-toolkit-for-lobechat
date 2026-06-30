@@ -7,7 +7,8 @@
 3. 共享 store （1 个连接池 max_size=3）→ 所有 agent 的 store + MemoryManager
 4. 加载所有 agent → 绑定 saver / store
 5. 全局 VectorManager → 注入到 vector_search_tool + MemoryManager
-6. 启动数据清理调度器 / Langfuse
+6. Neo4j 同步 driver（供 neo4j_graphrag retriever 使用）
+7. 启动数据清理调度器 / Langfuse
 
 连接池统计（Postgres 后端）：
   - shared_saver : max_size=3  （替代原来 12 个 agent 各 1 个 = 12 个池）
@@ -18,7 +19,9 @@ from collections.abc import AsyncGenerator
 from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Any
 import asyncio
+import os
 
+from neo4j import GraphDatabase
 from qdrant_client import models as qdrant_models
 from agents import get_agent, get_all_agent_info, load_agent
 from memory import initialize_database, initialize_store
@@ -29,6 +32,7 @@ from core import get_embedding_model, settings
 from langfuse import Langfuse
 from .service import cleanup_manager
 from utils.log_utils import get_logger
+from agents.graph_rag_agent.neo4j_client import set_neo4j_driver, close_neo4j_driver
 
 logger = get_logger(__name__)
 
@@ -198,7 +202,16 @@ async def lifespan(app) -> AsyncGenerator[None, None]:
             #    6c. 存入 app.state（供 HTTP 处理器使用）
             app.state.vector_manager = vector_manager
 
-            # 7. 初始化 MemoryManager（长期记忆）
+            # 7. Neo4j 同步 driver（供 neo4j_graphrag retriever / VectorRetriever 等使用）
+            neo4j_uri = os.getenv("NEO4J_URI", "bolt://192.168.10.51:7687")
+            neo4j_user = os.getenv("NEO4J_USER", "neo4j")
+            neo4j_password = os.getenv("NEO4J_PASSWORD", "slsltech")
+            neo4j_driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_password))
+            app.state.neo4j_driver = neo4j_driver
+            set_neo4j_driver(neo4j_driver)
+            logger.info("Neo4j 同步 driver 初始化完成：%s", neo4j_uri)
+
+            # 8. 初始化 MemoryManager（长期记忆）
             if settings.LONG_TERM_MEMORY_ENABLED:
                 memory_manager.vector_manager = vector_manager  # 复用同一个实例
                 memory_manager.set_store(shared_store)
@@ -208,10 +221,10 @@ async def lifespan(app) -> AsyncGenerator[None, None]:
                     _SHARED_POOL_SIZE,
                 )
 
-            # 8. 数据清理调度器
+            # 9. 数据清理调度器
             cleanup_task = asyncio.create_task(cleanup_manager.start_cleanup_scheduler())
 
-            # 9. Langfuse（可选）
+            # 10. Langfuse（可选）
             if settings.LANGFUSE_TRACING:
                 try:
                     Langfuse(
@@ -232,3 +245,11 @@ async def lifespan(app) -> AsyncGenerator[None, None]:
             if cleanup_task is not None:
                 cleanup_task.cancel()
             cleanup_manager.saver = None
+            # 关闭 Neo4j driver
+            if hasattr(app.state, "neo4j_driver") and app.state.neo4j_driver is not None:
+                try:
+                    app.state.neo4j_driver.close()
+                    close_neo4j_driver()
+                    logger.info("Neo4j 同步 driver 已关闭")
+                except Exception as exc:
+                    logger.error("关闭 Neo4j driver 失败: %s", exc)
