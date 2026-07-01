@@ -47,6 +47,21 @@ def load_examples() -> List[str]:
         "WHERE toUpper(c.companyName) CONTAINS toUpper('Netapp') "
         "  AND r.reportCalendarOrQuarter = '2023-06-30' "
         "RETURN count(DISTINCT m) AS investorCount",
+
+        # === 聚合过滤（用 WITH，不用 SQL 的 GROUP BY / HAVING）===
+        "USER INPUT: '2023年6月30日，被超过15家机构持有的公司有哪些' "
+        "QUERY: MATCH (m:Manager)-[r:OWNS_STOCK_IN]->(c:Company) "
+        "WHERE r.reportCalendarOrQuarter = '2023-06-30' "
+        "WITH c.companyName AS company, count(DISTINCT m) AS investorCount "
+        "WHERE investorCount > 15 "
+        "RETURN company, investorCount ORDER BY investorCount DESC",
+
+        "USER INPUT: 'BlackRock Inc. 在 2023 年持有哪些公司的股票？请列出前 10 家' "
+        "QUERY: MATCH (m:Manager)-[r:OWNS_STOCK_IN]->(c:Company) "
+        "WHERE toUpper(m.managerName) CONTAINS toUpper('BlackRock') "
+        "  AND r.reportCalendarOrQuarter STARTS WITH '2023' "
+        "RETURN c.companyName AS company, r.shares AS shares, r.value AS value, r.reportCalendarOrQuarter AS quarter "
+        "ORDER BY r.value DESC LIMIT 10",
         # ==================名字类===================
         "USER INPUT: '投资者Vanguard持有哪些公司' "
         "QUERY: MATCH (m:Manager)-[r:OWNS_STOCK_IN]->(c:Company) "
