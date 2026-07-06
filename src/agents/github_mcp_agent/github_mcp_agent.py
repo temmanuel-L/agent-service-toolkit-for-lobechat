@@ -11,6 +11,7 @@ from langgraph.graph.state import CompiledStateGraph
 
 from agents.lazy_agent import LazyLoadingAgent
 from core import get_model, settings
+from memory.long_term_concat_for_agents import wrap_agent_with_long_term_entry
 
 logger = logging.getLogger(__name__)
 
@@ -90,11 +91,13 @@ class GitHubMCPAgent(LazyLoadingAgent):
         """Create the GitHub MCP agent graph."""
         model = get_model(settings.DEFAULT_MODEL)
 
-        return create_agent(
-            model=model,
-            tools=self._mcp_tools,
-            name="github-mcp-agent",
-            system_prompt=prompt,
+        return wrap_agent_with_long_term_entry(
+            create_agent(
+                model=model,
+                tools=self._mcp_tools,
+                name="github-mcp-agent",
+                system_prompt=prompt,
+            )
         )
 
 

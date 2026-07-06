@@ -11,8 +11,8 @@
 3. 返回 ``{"research": {<领域键>: block}}``，block 含 narrative / line_items / subtotal /
    currency / sources / disclaimer，供主图 ``merge_research`` 合并。
 
-输入仅为 **文本**（``state`` 字符串字段 + 检索摘要），无图片/语音。默认对话模型见主模块
-``multi_agent_travel_helper_agent.SUB_AGENT_MODEL``（与 intake/compose 所用主模型可分离）。
+输入仅为 **文本**（``state`` 字符串字段 + 检索摘要），无图片/语音。默认模型见
+``SUB_AGENT_MODEL``（``OpenAICompatibleName.OPENAI_NAME`` → MiniMax-M3；``get_model(..., fast=True)``）。
 
 主图中的拓扑
 ------------
@@ -33,7 +33,7 @@ from langchain_core.runnables import RunnableConfig
 
 from agents.multi_agent_travel_helper.multi_agent_travel_helper_agent import SUB_AGENT_MODEL
 from agents.tools import tavily_search
-from agents.utils import get_silent_config
+from agents.utils import coerce_state_str, get_silent_config
 from core import get_model
 from utils.log_utils import get_logger
 
@@ -99,7 +99,7 @@ def _tool_args_from_call(tc: dict[str, Any]) -> dict[str, Any]:
 async def _web(query: str, config: RunnableConfig) -> str:
     """先 ``get_model(...).bind_tools([tavily_search]).ainvoke``，再执行模型选择的 WebSearch；失败时回退直连工具。"""
     sub = get_silent_config(config)
-    llm = get_model(config["configurable"].get("model", SUB_AGENT_MODEL))
+    llm = get_model(config["configurable"].get("model", SUB_AGENT_MODEL), fast=True)
     bound = llm.bind_tools([tavily_search])
     try:
         ai = await bound.ainvoke(
@@ -174,7 +174,7 @@ async def _llm_summarize(
     subtotal 优先取单条含 line_total 的项，否则对全部 line_items 求和。
     """
     sub = get_silent_config(config)
-    llm = get_model(config["configurable"].get("model", SUB_AGENT_MODEL))
+    llm = get_model(config["configurable"].get("model", SUB_AGENT_MODEL), fast=True)
     prompt = [
         SystemMessage(content=system),
         HumanMessage(content=user),
@@ -204,8 +204,8 @@ async def _llm_summarize(
 
 def _ctx(state: dict[str, Any]) -> str:
     """拼一段结构化上下文串，注入各 worker 的 user prompt；含定价反馈时附带用户调整诉求。"""
-    dest = state.get("destination") or "未知目的地"
-    origin = state.get("origin_city") or "未知出发地"
+    dest = coerce_state_str(state.get("destination")) or "未知目的地"
+    origin = coerce_state_str(state.get("origin_city")) or "未知出发地"
     start = state.get("trip_start_date") or "待定"
     days = state.get("trip_duration_days") or 5
     party = state.get("party_size") or 2
@@ -233,7 +233,7 @@ _JSON_ARRAY_HINT = "务必用 Markdown 代码块输出，例如：\n```json\n[..
 
 async def worker_weather(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
     """目的地 + 行程窗口天气；line_items 可为空或仅含无金额的气象要点。"""
-    q = f"{state.get('destination') or ''} 天气预报 {state.get('trip_start_date') or ''} 未来{state.get('trip_duration_days') or 5}天"
+    q = f"{coerce_state_str(state.get('destination'))} 天气预报 {coerce_state_str(state.get('trip_start_date'))} 未来{state.get('trip_duration_days') or 5}天"
     snippets = await _web(q, config)
     sys = (
         "你是旅行天气助手。根据检索摘要先写简短中文预报，再单独给出 line_items。"
@@ -255,7 +255,7 @@ async def worker_weather(state: dict[str, Any], config: RunnableConfig) -> dict[
 
 async def worker_transport(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
     """出发地→目的地 大交通（机票/高铁等）检索与结构化估价。"""
-    d, o = state.get("destination"), state.get("origin_city")
+    d, o = coerce_state_str(state.get("destination")), coerce_state_str(state.get("origin_city"))
     q = f"{o}到{d} 机票 OR 高铁 价格 时刻表 {state.get('trip_start_date') or ''}"
     snippets = await _web(q, config)
     sys = (
@@ -280,7 +280,7 @@ async def worker_transport(state: dict[str, Any], config: RunnableConfig) -> dic
 
 async def worker_hotel(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
     """目的地酒店：间夜、起止日期等写入 line_items，供 mobility 按窗口过滤。"""
-    dest = state.get("destination") or ""
+    dest = coerce_state_str(state.get("destination"))
     q = f"{dest} 酒店 价格 每晚 近景区 {state.get('hotel_price_preference') or ''}"
     snippets = await _web(q, config)
     sys = (
@@ -308,7 +308,7 @@ async def worker_hotel(state: dict[str, Any], config: RunnableConfig) -> dict[st
 
 async def worker_food(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
     """餐饮人均与人数乘积形成 line_total，纳入预算四类合计。"""
-    dest = state.get("destination") or ""
+    dest = coerce_state_str(state.get("destination"))
     q = f"{dest} 餐厅 推荐 人均消费 {state.get('food_preference') or ''}"
     snippets = await _web(q, config)
     sys = (
@@ -333,14 +333,14 @@ async def worker_food(state: dict[str, Any], config: RunnableConfig) -> dict[str
 
 async def worker_culture(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
     """文化背景叙事，不参与计价；compose 阶段截取 narrative 注入行程文案。"""
-    dest = state.get("destination") or ""
+    dest = coerce_state_str(state.get("destination"))
     sites = state.get("sites") or []
     q = f"{dest} 文化 历史 博物馆 节庆 {sites}"
     snippets = await _web(q, config)
     sys = "你是文化导游。根据摘要写一段中文文化介绍（景点、节庆、博物馆等）；不必输出 JSON 或 line_items。"
     user = f"上下文: {_ctx(state)}\n\n检索摘要:\n{snippets[:6000]}"
     sub = get_silent_config(config)
-    llm = get_model(config["configurable"].get("model", SUB_AGENT_MODEL))
+    llm = get_model(config["configurable"].get("model", SUB_AGENT_MODEL), fast=True)
     resp = await llm.ainvoke(
         [SystemMessage(content=sys), HumanMessage(content=user)],
         config=sub,
@@ -359,7 +359,7 @@ async def worker_culture(state: dict[str, Any], config: RunnableConfig) -> dict[
 
 async def worker_ticket(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
     """景点门票：结合 sites 列表检索成人票等公开报价并结构化。"""
-    dest = state.get("destination") or ""
+    dest = coerce_state_str(state.get("destination"))
     sites = state.get("sites") or []
     q = f"{dest} {' '.join(sites)} 门票 价格 成人票"
     snippets = await _web(q, config)

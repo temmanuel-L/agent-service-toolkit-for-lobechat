@@ -15,13 +15,12 @@ RAG 知识库助手智能体
 
 from typing import Annotated, Literal, TypedDict, List
 
-from langgraph.graph import END, StateGraph
+from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.managed import RemainingSteps
 from langgraph.prebuilt import ToolNode
 from langchain_core.messages import BaseMessage
 
-# 导入通用 RAG 模块（含防死循环的 router / 原子计数节点 / force_done 节点）
 from rag import (
     SearchKnowledgeTool,
     create_rag_model_node,
@@ -33,6 +32,7 @@ from rag import (
     create_memory_vs_kb_router_node,
     tool_rounds_add_reducer,
 )
+from memory.long_term_concat_for_agents import prepare_long_term_entry
 from utils.log_utils import get_logger
 
 logger = get_logger(__name__)
@@ -64,6 +64,7 @@ tools = [SearchKnowledgeTool()]
 agent = StateGraph(AgentState)
 
 
+agent.add_node("prepare_long_term", prepare_long_term_entry)
 agent.add_node("reset_rounds", create_reset_rounds_node())
 agent.add_node("memory_router", create_memory_vs_kb_router_node())
 agent.add_node("model", create_rag_model_node(tools=tools, safety_check=True))
@@ -71,7 +72,8 @@ agent.add_node("tools", create_tools_node_with_rounds_increment(ToolNode(tools))
 agent.add_node("evaluator", create_rag_evaluator_node())
 agent.add_node("force_done", create_force_done_node())
 
-agent.set_entry_point("reset_rounds")
+agent.add_edge(START, "prepare_long_term")
+agent.add_edge("prepare_long_term", "reset_rounds")
 agent.add_edge("reset_rounds", "memory_router")
 agent.add_edge("memory_router", "model")
 

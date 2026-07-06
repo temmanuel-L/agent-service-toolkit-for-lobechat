@@ -48,6 +48,7 @@ from langchain_core.tools import BaseTool
 from langgraph.graph import MessagesState
 
 from core import get_model, settings
+from memory.long_term_concat_for_agents import build_llm_messages
 from utils.log_utils import get_logger
 
 logger = get_logger(__name__)
@@ -222,8 +223,7 @@ def filter_frontend_messages(messages: list) -> list:
     """
     过滤前端（如 LobeChat）发送的系统消息
     
-    前端可能会注入与我们指令冲突的 SystemMessage，
-    这个函数将其过滤掉，只保留用户和助手的消息。以及长期记忆消息
+    过滤前端（如 LobeChat）注入的 SystemMessage；长期记忆改由 configurable + concat 注入，不在此保留。
     
     Args:
         messages: 原始消息列表
@@ -234,10 +234,6 @@ def filter_frontend_messages(messages: list) -> list:
     filtered = []
     for msg in messages:
         if isinstance(msg, SystemMessage):
-            source = getattr(msg, "additional_kwargs", {}) or {}
-            if source.get("source") == "long_term_memory":
-                filtered.append(msg)
-                continue
             continue
         filtered.append(msg)
     return filtered
@@ -323,10 +319,13 @@ def create_rag_model_node(
         
         # 5. 生成系统提示词
         system_prompt = system_prompt_fn(kb_ids, user_language)
-        system_msg = SystemMessage(content=system_prompt)
 
-        # 6. 组装消息
-        messages = [system_msg] + filtered_messages
+        # 6. 组装消息：长期记忆与 RAG system 合并为一条 SystemMessage
+        messages = build_llm_messages(
+            filtered_messages,
+            config,
+            agent_system=system_prompt,
+        )
 
         # 6.1 记录本次调用时的检索上下文情况，便于排查「RAG 失效」
         # 查找最近一次检索工具（如 search_knowledge）返回的 ToolMessage（若有）

@@ -14,6 +14,7 @@ from schema.models import (
     FakeModelName,
     GroqModelName,
     OllamaModelName,
+    OpenAICompatibleName,
     OpenAIModelName,
 )
 
@@ -24,6 +25,31 @@ def test_get_model_openai():
         assert isinstance(model, ChatOpenAI)
         assert model.model_name == "gpt-5-nano"
         assert model.streaming is True
+
+
+def test_get_model_openai_fast():
+    with patch.dict(os.environ, {"OPENAI_API_KEY": "test_key"}):
+        model = get_model(OpenAIModelName.GPT_5_NANO, fast=True)
+        assert isinstance(model, ChatOpenAI)
+        assert model.reasoning_effort == "minimal"
+
+
+def test_get_model_openai_compatible_fast():
+    with patch("core.settings.settings.COMPATIBLE_BASE_URL", "http://localhost/v1"), patch(
+        "core.settings.settings.COMPATIBLE_API_KEY", "test_key"
+    ):
+        model = get_model(OpenAICompatibleName.OPENAI_NAME, fast=True)
+        assert isinstance(model, ChatOpenAI)
+        assert model.model_name == "MiniMax-M3"
+        assert model.extra_body == {"thinking": {"type": "disabled"}}
+
+
+def test_get_model_openai_compatible_default_disables_thinking():
+    with patch("core.settings.settings.COMPATIBLE_BASE_URL", "http://localhost/v1"), patch(
+        "core.settings.settings.COMPATIBLE_API_KEY", "test_key"
+    ):
+        model = get_model(OpenAICompatibleName.OPENAI_NAME)
+        assert model.extra_body == {"thinking": {"type": "disabled"}}
 
 
 def test_get_model_anthropic():

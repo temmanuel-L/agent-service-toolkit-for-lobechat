@@ -87,8 +87,27 @@ ModelT: TypeAlias = (
 )
 
 
+def _minimax_compatible_extra_body(api_model_name: str) -> dict[str, Any]:
+    """MiniMax OpenAI 兼容 API：M3 可通过 thinking=disabled 完全关闭推理输出。"""
+    return {"extra_body": {"thinking": {"type": "disabled"}}}
+
+
+def _chatopenai_fast_kwargs(api_model_name: str) -> dict[str, Any]:
+    """子智能体/工具调度等低延迟场景：在兼容网关已关 thinking 基础上，再弱化官方推理模型。
+
+    - OpenAI 官方推理模型：``reasoning_effort='minimal'``（Chat Completions API）。
+    - MiniMax M3 的 thinking 关闭见 ``_minimax_compatible_extra_body``（OpenAICompatible 分支默认已带）。
+    - 勿传 ``reasoning=False``：ChatOpenAI 的 ``reasoning`` 为 dict | None，bool 无效。
+    """
+    lower = api_model_name.lower()
+    kwargs: dict[str, Any] = {}
+    if lower.startswith(("gpt-5", "o1", "o3", "o4")):
+        kwargs["reasoning_effort"] = "minimal"
+    return kwargs
+
+
 @cache
-def get_model(model_name: AllModelEnum, /) -> ModelT:
+def get_model(model_name: AllModelEnum, /, *, fast: bool = False) -> ModelT:
     # NOTE: models with streaming=True will send tokens as they are generated
     # if the /stream endpoint is called with stream_tokens=True (the default)
     api_model_name = _MODEL_TABLE.get(model_name)
@@ -97,20 +116,29 @@ def get_model(model_name: AllModelEnum, /) -> ModelT:
         raise ValueError(f"Unsupported model: {model_name}")
 
     if model_name in OpenAIModelName:
-        return ChatOpenAI(model=api_model_name, streaming=True)
+        # ChatOpenAI.reasoning 类型为 dict | None（Responses API），勿传 bool。
+        # 不传 reasoning 即不启用 OpenAI 官方 reasoning 配置；o/gpt-5 系列若仍推理，见 reasoning_effort。
+        openai_kwargs: dict[str, Any] = {"model": api_model_name, "streaming": True}
+        if fast:
+            openai_kwargs.update(_chatopenai_fast_kwargs(api_model_name))
+        return ChatOpenAI(**openai_kwargs)
     if model_name in OpenAICompatibleName:
         # Check for both explicit compatible settings and DMX proxy settings
         if not settings.COMPATIBLE_BASE_URL:
             logger.error("OpenAICompatible provider is active but missing required base_url configuration.")
             raise ValueError("OpenAICompatible provider is active but missing required base_url configuration.")
-        
-        return ChatOpenAI(
-            model=api_model_name,
-            temperature=0.5,
-            streaming=True,
-            base_url=settings.COMPATIBLE_BASE_URL,
-            api_key=settings.COMPATIBLE_API_KEY,
-        )
+
+        compatible_kwargs: dict[str, Any] = {
+            "model": api_model_name,
+            "temperature": 0.5,
+            "streaming": True,
+            "base_url": settings.COMPATIBLE_BASE_URL,
+            "api_key": settings.COMPATIBLE_API_KEY,
+        }
+        compatible_kwargs.update(_minimax_compatible_extra_body(api_model_name))
+        if fast:
+            compatible_kwargs.update(_chatopenai_fast_kwargs(api_model_name))
+        return ChatOpenAI(**compatible_kwargs)
     if model_name in AzureOpenAIModelName:
         if not settings.AZURE_OPENAI_API_KEY or not settings.AZURE_OPENAI_ENDPOINT:
             raise ValueError("Azure OpenAI API key and endpoint must be configured")
@@ -151,21 +179,22 @@ def get_model(model_name: AllModelEnum, /) -> ModelT:
             model=api_model_name,
             temperature=0.5,
             base_url=base_url if base_url else None,
+            reasoning=False
             # num_predict=4096,
         )
         
-        # 如果配置了 DMX 代理，则为 Ollama 添加回退机制
-        if settings.DMX_CHAT_URL or settings.COMPATIBLE_BASE_URL:
-            # 创建一个用于回退的 DMX 模型
-            fallback_model = ChatOpenAI(
-                model=settings.COMPATIBLE_MODEL or OpenAICompatibleName.OPENAI_NAME.value,
-                temperature=0.5,
-                streaming=True,
-                base_url=settings.COMPATIBLE_BASE_URL or settings.DMX_CHAT_URL,
-                api_key=settings.COMPATIBLE_API_KEY or (settings.OPENAI_API_KEY.get_secret_value() if settings.OPENAI_API_KEY else None),
-            )
-            # 使用 LangChain 的 with_fallbacks 实现运行时自动切换
-            return ollama_model.with_fallbacks([fallback_model]) # type: ignore
+        # # 如果配置了 DMX 代理，则为 Ollama 添加回退机制
+        # if settings.DMX_CHAT_URL or settings.COMPATIBLE_BASE_URL:
+        #     # 创建一个用于回退的 DMX 模型
+        #     fallback_model = ChatOpenAI(
+        #         model=settings.COMPATIBLE_MODEL or OpenAICompatibleName.OPENAI_NAME.value,
+        #         temperature=0.5,
+        #         streaming=True,
+        #         base_url=settings.COMPATIBLE_BASE_URL or settings.DMX_CHAT_URL,
+        #         api_key=settings.COMPATIBLE_API_KEY or (settings.OPENAI_API_KEY.get_secret_value() if settings.OPENAI_API_KEY else None),
+        #     )
+        #     # 使用 LangChain 的 with_fallbacks 实现运行时自动切换
+        #     return ollama_model.with_fallbacks([fallback_model]) # type: ignore
             
         return ollama_model
     if model_name in OpenRouterModelName:

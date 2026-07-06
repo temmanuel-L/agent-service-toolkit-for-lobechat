@@ -13,17 +13,18 @@ import uuid
 from datetime import datetime
 from typing import Any, List, Literal, Optional
 
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, MessagesState, START, StateGraph
 from langgraph.managed import RemainingSteps
 from langgraph.types import interrupt
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from agents.multimodal_input_processor import MultimodalInputProcessor
-from agents.utils import build_interrupt_text_message_update
+from agents.utils import build_interrupt_text_message_update, coerce_optional_str
 from core import get_model, settings
+from memory.long_term_concat_for_agents import build_llm_messages, prepare_long_term_entry
 from utils.log_utils import get_logger
 
 logger = get_logger(__name__)
@@ -62,6 +63,23 @@ class TravelInfoExtraction(BaseModel):
         default=None,
         description="用户对本次旅行的兴趣列表（如：美食、历史、自然、游乐园、购物中心等）。仅在提及时以列表形式抽取。"
     )
+
+    @field_validator("destination", mode="before")
+    @classmethod
+    def _unwrap_destination(cls, v: Any) -> Any:
+        return coerce_optional_str(v)
+
+    @field_validator("interests", mode="before")
+    @classmethod
+    def _parse_interests_json(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            try:
+                parsed = json.loads(v)
+                if isinstance(parsed, list):
+                    return parsed
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return v
 
 
 # =============================================================================
@@ -155,16 +173,6 @@ def _normalize_extraction_args(args: dict[str, Any]) -> dict[str, Any]:
     out = {}
     for key, value in args.items():
         if value is None or value == "null" or value == "":
-            out[key] = None
-            continue
-        if key == "interests" and isinstance(value, str):
-            try:
-                parsed = json.loads(value)
-                out[key] = list(parsed) if isinstance(parsed, list) else None
-            except (json.JSONDecodeError, TypeError):
-                out[key] = None
-            continue
-        if key == "destination" and isinstance(value, str) and value.strip() == "":
             out[key] = None
             continue
         out[key] = value
@@ -290,13 +298,6 @@ async def extract_info(state: PlannerState, config: RunnableConfig) -> dict:
             # 智谱等模型有时将 tool call args 中的 null/数组以 JSON 字符串形式返回，需归一化为 Python 类型
             args = _normalize_extraction_args(args)
 
-            # Auto-correction: If destination is a list, move it to interests
-            if isinstance(args.get("destination"), list):
-                logger.warning(f"LLM 将列表填入了 destination 字段，自动修正: {args['destination']}")
-                if not args.get("interests"):
-                    args["interests"] = args["destination"]
-                args["destination"] = None
-
             extracted = TravelInfoExtraction(**args)
             logger.info(f"Extracted: destination={extracted.destination}, interests={extracted.interests}")
 
@@ -308,7 +309,9 @@ async def extract_info(state: PlannerState, config: RunnableConfig) -> dict:
                 if not state.get("destination"):
                     updates["destination"] = extracted.destination
                 else:
-                    logger.info(f"Destination already set ({state['destination']}), demoting '{extracted.destination}' to interests")
+                    logger.info(
+                        f"Destination already set ({state['destination']}), demoting '{extracted.destination}' to interests"
+                    )
                     if extracted.interests is None:
                         extracted.interests = []
                     if extracted.destination not in extracted.interests:
@@ -422,6 +425,16 @@ async def create_itinerary(state: PlannerState, config: RunnableConfig) -> dict:
         destination=destination,
         interests=interests_str
     )
+    agent_system = next(
+        (m.content for m in formatted_messages if isinstance(m, SystemMessage)),
+        None,
+    )
+    conversation = [m for m in formatted_messages if not isinstance(m, SystemMessage)]
+    formatted_messages = build_llm_messages(
+        conversation,
+        config,
+        agent_system=agent_system if isinstance(agent_system, str) else None,
+    )
     
     try:
         # 已开启流式输出，handlers.py 中有去重逻辑避免重复消息
@@ -472,6 +485,7 @@ def route_by_completeness(state: PlannerState) -> Literal["complete", "incomplet
 workflow = StateGraph(PlannerState)
 
 # 添加节点
+workflow.add_node("prepare_long_term", prepare_long_term_entry)
 workflow.add_node("normalize_input", normalize_input)
 workflow.add_node("vision_enrich", vision_enrich)
 workflow.add_node("extract_info", extract_info)
@@ -479,7 +493,8 @@ workflow.add_node("ask_missing", ask_missing_info)
 workflow.add_node("create_itinerary", create_itinerary)
 
 # 入口：先规范化当前轮输入，再按多模态路由
-workflow.add_edge(START, "normalize_input")
+workflow.add_edge(START, "prepare_long_term")
+workflow.add_edge("prepare_long_term", "normalize_input")
 workflow.add_conditional_edges(
     "normalize_input",
     route_input_modality,

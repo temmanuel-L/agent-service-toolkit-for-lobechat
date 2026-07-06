@@ -36,12 +36,13 @@ from typing import List, Literal, Optional
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import RunnableConfig
-from langgraph.graph import END, MessagesState, StateGraph
+from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.managed import RemainingSteps
 from langgraph.types import interrupt
 from pydantic import BaseModel, Field
 
 from core import get_model, settings
+from memory.long_term_concat_for_agents import prepare_long_term_entry
 from utils.log_utils import get_logger
 
 # 尝试导入 music21 库，如果不存在则标记为不可用
@@ -761,6 +762,7 @@ def route_by_completeness(state: MusicState) -> Literal["complete", "incomplete"
 workflow = StateGraph(MusicState)
 
 # 添加节点
+workflow.add_node("prepare_long_term", prepare_long_term_entry)
 workflow.add_node("extract_info", extract_info)
 workflow.add_node("ask_missing", ask_missing_info)
 workflow.add_node("generate_melody", generate_melody)
@@ -768,8 +770,8 @@ workflow.add_node("generate_harmony", generate_harmony)
 workflow.add_node("generate_rhythm", generate_rhythm)
 workflow.add_node("convert_to_midi", convert_to_midi)
 
-# 设置入口点
-workflow.set_entry_point("extract_info")
+workflow.add_edge(START, "prepare_long_term")
+workflow.add_edge("prepare_long_term", "extract_info")
 
 # 添加条件边：提取信息后根据完整性路由
 workflow.add_conditional_edges(

@@ -32,6 +32,7 @@ from fastapi.responses import StreamingResponse
 from langchain_core.messages import AIMessage, AIMessageChunk, SystemMessage, HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langfuse import Langfuse, propagate_attributes
+from langgraph.graph.message import RemoveMessage
 from langgraph.types import Command, Interrupt
 from langsmith import Client as LangsmithClient
 from langsmith.utils import LangSmithAuthError
@@ -39,6 +40,10 @@ from langsmith.utils import LangSmithAuthError
 from agents.agents import DEFAULT_AGENT, AgentGraph, get_agent, get_all_agent_info
 from core import settings
 from memory.long_term import memory_manager
+from memory.long_term_concat_for_agents import (
+    LONG_TERM_MEMORY_CONTENT_KEY,
+    LONG_TERM_MEMORY_SKIP_KEY,
+)
 
 from schema import (
     ChatMessage,
@@ -340,7 +345,13 @@ async def _handle_input(
     # 处理用户提供的额外配置参数
     if user_input.agent_config:
         # 检查是否包含保留关键字（包括即使不在configurable中的'model'）
-        reserved_keys = {"thread_id", "user_id", "model"}
+        reserved_keys = {
+            "thread_id",
+            "user_id",
+            "model",
+            LONG_TERM_MEMORY_CONTENT_KEY,
+            LONG_TERM_MEMORY_SKIP_KEY,
+        }
         if overlap := reserved_keys & user_input.agent_config.keys():
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -348,27 +359,22 @@ async def _handle_input(
             )
         configurable.update(user_input.agent_config)
 
-    # 添加元数据，用于后续的数据检索和筛选
     metadata = {"user_id": user_id}
-    config = RunnableConfig(
-        configurable=configurable,
-        run_id=run_id,
-        callbacks=callbacks,
-        metadata=metadata,
-    )
 
-    # 检查是否有需要恢复的中断任务
-    state = await agent.aget_state(config=config)
+    # 检查是否有需要恢复的中断任务（需在记忆构建前判定）
+    pre_config = RunnableConfig(configurable=configurable)
+    state = await agent.aget_state(config=pre_config)
     interrupted_tasks = [
         task for task in state.tasks if hasattr(task, "interrupts") and task.interrupts
     ]
     is_interrupted = bool(interrupted_tasks)
 
-    # 预先构建长期记忆系统消息（仅在非中断恢复时注入）
+    # 预先构建长期记忆（仅在非中断恢复时）；写入 configurable，不注入 messages checkpoint
     memory_message = None
-    if (
+    if is_interrupted:
+        configurable[LONG_TERM_MEMORY_SKIP_KEY] = True
+    elif (
         settings.LONG_TERM_MEMORY_ENABLED
-        and not is_interrupted
         and user_input.message
         and user_id
     ):
@@ -376,9 +382,10 @@ async def _handle_input(
         try:
             memory_message = await memory_manager.abuild_system_message(
                 user_id=user_id,
-                # 这里仅为长期记忆检索构造文本 query，不会影响传给 agent 图的原始多模态消息结构。
                 query=convert_message_content_to_string(user_input.message),
             )
+            if memory_message and memory_message.content:
+                configurable[LONG_TERM_MEMORY_CONTENT_KEY] = memory_message.content
             logger.info(
                 "长期记忆注入完成: user_id=%s has_memory=%s elapsed_ms=%.2f",
                 user_id,
@@ -393,6 +400,13 @@ async def _handle_input(
                 exc,
             )
 
+    config = RunnableConfig(
+        configurable=configurable,
+        run_id=run_id,
+        callbacks=callbacks,
+        metadata=metadata,
+    )
+
     # 根据是否存在中断任务决定输入数据的格式
     if is_interrupted:
         # 中断恢复时保持原始消息结构，确保多模态 list 不会被提前压平成纯文本。
@@ -400,11 +414,8 @@ async def _handle_input(
         resume_payload: str | list[Any] = user_input.message
         input_data: Command[Any] | dict[str, Any] = Command(resume=resume_payload)
     else:
-        # 正常情况下将用户消息包装成HumanMessage
-        messages = [HumanMessage(content=user_input.message)]
-        if memory_message:
-            messages.insert(0, memory_message)
-        input_data = {"messages": messages}
+        # 正常情况下将用户消息包装成 HumanMessage（长期记忆经 configurable + concat 注入 LLM）
+        input_data = {"messages": [HumanMessage(content=user_input.message)]}
 
     # 构建执行参数
     kwargs = {
@@ -667,6 +678,10 @@ async def message_generator(
                         
                         # 过滤消息
                         for msg in update_messages:
+                            # LangGraph 内部状态操作，不向客户端转发
+                            if isinstance(msg, RemoveMessage):
+                                continue
+
                             # DEBUG: 记录每条消息的详细信息
                             msg_type = type(msg).__name__
                             msg_content_len = len(msg.content) if hasattr(msg, 'content') and msg.content else 0

@@ -1,4 +1,6 @@
 from typing import Any
+import re
+
 from pydantic import BaseModel, Field
 
 from langchain_core.messages import ChatMessage, HumanMessage
@@ -6,6 +8,47 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.types import StreamWriter
 
 from agents.multimodal_input_processor import MultimodalInputProcessor
+
+
+def coerce_optional_str(value: Any) -> str | None:
+    """将 tool/state 返回值规范为 Optional[str]（供 Pydantic mode=before 或业务读取）。"""
+    if value is None or value == "null" or value == "":
+        return None
+    if isinstance(value, str):
+        s = value.strip()
+        return s or None
+    if isinstance(value, list):
+        for item in value:
+            s = coerce_optional_str(item)
+            if s:
+                return s
+        return None
+    if isinstance(value, dict):
+        for key in ("city", "destination", "place", "name"):
+            val = value.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+        return None
+    s = str(value).strip()
+    return s or None
+
+
+def coerce_state_str(value: Any) -> str:
+    """从 state 安全读取标量字符串槽位（兼容误存的 list/dict）。"""
+    return coerce_optional_str(value) or ""
+
+
+def normalize_date_optional_str(value: Any) -> str | None:
+    """将常见中文/短格式日期规范为 YYYY-MM-DD（如 2026-7-10）。"""
+    s = coerce_optional_str(value)
+    if not s:
+        return None
+    m = re.match(r"^(\d{4})[-/年](\d{1,2})[-/月](\d{1,2})", s)
+    if m:
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        return f"{y:04d}-{mo:02d}-{d:02d}"
+    return s
+
 
 class CustomData(BaseModel):
     "Custom data being sent by an agent"

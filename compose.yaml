@@ -84,6 +84,12 @@ services:
         - path: src/memory/
           action: sync+restart
           target: /app/memory/
+        - path: src/rag/
+          action: sync+restart
+          target: /app/rag/
+        - path: src/utils/
+          action: sync+restart
+          target: /app/utils/
 
   # =========================================
   # Langfuse V3 Infrastructure

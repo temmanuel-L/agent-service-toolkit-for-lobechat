@@ -4,6 +4,7 @@ from langchain.agents import create_agent
 from langgraph_supervisor import create_supervisor
 
 from core import get_model, settings
+from memory.long_term_concat_for_agents import wrap_agent_with_long_term_entry
 
 model = get_model(settings.DEFAULT_MODEL)
 
@@ -59,4 +60,4 @@ workflow = create_supervisor(
     output_mode="full_history",  # otherwise when reloading conversations, the sub-agents' messages are not included
 )
 
-langgraph_supervisor_agent = workflow.compile()
+langgraph_supervisor_agent = wrap_agent_with_long_term_entry(workflow.compile())

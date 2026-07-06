@@ -2,8 +2,10 @@ import random
 from typing import Literal
 
 from langchain_core.messages import AIMessage
-from langgraph.graph import START, MessagesState, StateGraph
+from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.types import Command
+
+from memory.long_term_concat_for_agents import prepare_long_term_entry
 
 
 class AgentState(MessagesState, total=False):
@@ -46,7 +48,9 @@ def node_c(state: AgentState):
 
 
 builder = StateGraph(AgentState)
-builder.add_edge(START, "node_a")
+builder.add_node("prepare_long_term", prepare_long_term_entry)
+builder.add_edge(START, "prepare_long_term")
+builder.add_edge("prepare_long_term", "node_a")
 builder.add_node(node_a)
 builder.add_node(node_b)
 builder.add_node(node_c)

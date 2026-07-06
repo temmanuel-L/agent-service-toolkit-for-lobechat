@@ -16,6 +16,7 @@ from langgraph.graph.message import add_messages
 from langgraph.types import interrupt
 
 from core import get_model, settings
+from memory.long_term_concat_for_agents import build_llm_messages, prepare_long_term_entry
 from utils.log_utils import get_logger
 from agents.utils import get_silent_config
 
@@ -201,11 +202,11 @@ async def synthesis_node(state: AgentState, config: RunnableConfig) -> dict:
     4. 格式：使用清晰的 Markdown 层级。
     """
 
-    prompt = [
-        SystemMessage(content="你是一位不直接复述素材，而是进行二次深度创作的专业分析师。"),
-        HumanMessage(content=context)
-    ]
-
+    prompt = build_llm_messages(
+        [HumanMessage(content=context)],
+        config,
+        agent_system="你是一位不直接复述素材，而是进行二次深度创作的专业分析师。",
+    )
     # 3. 真正执行生成
     llm = get_model(config["configurable"].get("model", settings.DEFAULT_MODEL))
     response = await llm.ainvoke(prompt, config)
@@ -226,6 +227,7 @@ async def synthesis_node(state: AgentState, config: RunnableConfig) -> dict:
 workflow = StateGraph(AgentState)
 
 # 添加节点
+workflow.add_node("prepare_long_term", prepare_long_term_entry)
 workflow.add_node("extract_topic", extract_topic_node)
 workflow.add_node("ask_missing", ask_missing_info)
 workflow.add_node("distributor", parallel_distributor) # 新增中转节点
@@ -234,8 +236,8 @@ workflow.add_node("questions_gen", questions_node)
 workflow.add_node("terms_ext", terms_node)
 workflow.add_node("synthesizer", synthesis_node)
 
-# 设置入口
-workflow.set_entry_point("extract_topic")
+workflow.add_edge(START, "prepare_long_term")
+workflow.add_edge("prepare_long_term", "extract_topic")
 
 # 设置topic判断的路由
 workflow.add_conditional_edges(

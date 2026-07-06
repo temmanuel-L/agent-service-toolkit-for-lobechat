@@ -4,13 +4,14 @@ from typing import Any
 
 from langchain_aws import AmazonKnowledgeBasesRetriever
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig, RunnableLambda, RunnableSerializable
 from langchain_core.runnables.base import RunnableSequence
-from langgraph.graph import END, MessagesState, StateGraph
+from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.managed import RemainingSteps
 
 from core import get_model, settings
+from memory.long_term_concat_for_agents import build_llm_messages, prepare_long_term_entry
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +48,7 @@ def get_kb_retriever():
 def wrap_model(model: BaseChatModel) -> RunnableSerializable[AgentState, AIMessage]:
     """Wrap the model with a system prompt for the Knowledge Base agent."""
 
-    def create_system_message(state):
+    def create_system_message(state, config: RunnableConfig):
         base_prompt = """You are a helpful assistant that provides accurate information based on retrieved documents.
 
         You will receive a query along with relevant documents retrieved from a knowledge base. Use these documents to inform your response.
@@ -67,13 +68,21 @@ def wrap_model(model: BaseChatModel) -> RunnableSerializable[AgentState, AIMessa
         if "kb_documents" in state:
             # Append document information to the system prompt
             document_prompt = f"\n\nI've retrieved the following documents that may be relevant to the query:\n\n{state['kb_documents']}\n\nPlease use these documents to inform your response to the user's query. Only use information from these documents and clearly indicate when you are unsure."
-            return [SystemMessage(content=base_prompt + document_prompt)] + state["messages"]
+            return build_llm_messages(
+                state["messages"],
+                config,
+                agent_system=base_prompt + document_prompt,
+            )
         else:
             # No documents were retrieved
             no_docs_prompt = (
                 "\n\nNo relevant documents were found in the knowledge base for this query."
             )
-            return [SystemMessage(content=base_prompt + no_docs_prompt)] + state["messages"]
+            return build_llm_messages(
+                state["messages"],
+                config,
+                agent_system=base_prompt + no_docs_prompt,
+            )
 
     preprocessor = RunnableLambda(
         create_system_message,
@@ -158,12 +167,13 @@ async def acall_model(state: AgentState, config: RunnableConfig) -> AgentState:
 agent = StateGraph(AgentState)
 
 # Add nodes
+agent.add_node("prepare_long_term", prepare_long_term_entry)
 agent.add_node("retrieve_documents", retrieve_documents)
 agent.add_node("prepare_augmented_prompt", prepare_augmented_prompt)
 agent.add_node("model", acall_model)
 
-# Set entry point
-agent.set_entry_point("retrieve_documents")
+agent.add_edge(START, "prepare_long_term")
+agent.add_edge("prepare_long_term", "retrieve_documents")
 
 # Add edges to define the flow
 agent.add_edge("retrieve_documents", "prepare_augmented_prompt")

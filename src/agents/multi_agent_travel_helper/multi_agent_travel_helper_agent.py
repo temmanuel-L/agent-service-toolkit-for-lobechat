@@ -35,13 +35,13 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, MessagesState, START, StateGraph
 from langgraph.managed import RemainingSteps
 from langgraph.types import interrupt
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from core import get_model, settings
+from memory.long_term_concat_for_agents import build_llm_messages, prepare_long_term_entry
 from schema.models import AllModelEnum, OpenAICompatibleName
 
-# 六路 research worker（WebSearch 调度 + 摘要/结构化）默认 LLM：纯文本链路，无多模态。
-# 请求里若带 configurable.model 则仍优先用该模型；否则用此处枚举（可改为 OpenAICompatibleName.OPENAI_NAME 等）。
+# 六路 research worker 默认 SUB_AGENT_MODEL（OpenAICompatible → MiniMax-M3，llm.py 默认关闭 thinking）。
 # SUB_AGENT_MODEL: AllModelEnum = settings.DEFAULT_MODEL
 SUB_AGENT_MODEL: AllModelEnum = OpenAICompatibleName.OPENAI_NAME
 
@@ -58,7 +58,13 @@ from agents.multi_agent_travel_helper.sub_agents import (
     worker_transport,
     worker_weather,
 )
-from agents.utils import build_interrupt_text_message_update, get_silent_config
+from agents.utils import (
+    build_interrupt_text_message_update,
+    coerce_optional_str,
+    coerce_state_str,
+    get_silent_config,
+    normalize_date_optional_str,
+)
 from utils.log_utils import get_logger
 
 logger = get_logger(__name__)
@@ -235,6 +241,37 @@ class TravelHelperExtraction(BaseModel):
     budget_currency: Optional[str] = Field(None, description="币种，默认CNY")
     party_size: Optional[int] = Field(None, description="出行人数")
 
+    @field_validator(
+        "destination",
+        "origin_city",
+        "food_preference",
+        "travel_price_preference",
+        "site_price_preference",
+        "hotel_price_preference",
+        "budget_currency",
+        mode="before",
+    )
+    @classmethod
+    def _coerce_str_fields(cls, v: Any) -> Any:
+        return coerce_optional_str(v)
+
+    @field_validator("trip_start_date", mode="before")
+    @classmethod
+    def _coerce_trip_start_date(cls, v: Any) -> Any:
+        return normalize_date_optional_str(v)
+
+    @field_validator("sites", mode="before")
+    @classmethod
+    def _coerce_sites(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            try:
+                parsed = json.loads(v)
+                if isinstance(parsed, list):
+                    return parsed
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return v
+
 
 # 工具调用抽取：强调不臆造、景点粒度、必须通过 TravelHelperExtraction 产出
 EXTRACTION_SYSTEM_PROMPT = """你是旅行信息抽取助手。从用户消息中提取字段；只提取明确信息，不猜测。
@@ -255,7 +292,6 @@ FIELD_LABELS = {
     "trip_start_date": "行程开始日期（YYYY-MM-DD）",
     "sites": "想去的景点或活动（至少一项）",
 }
-
 
 def _last_human_message(messages: List[Any]) -> HumanMessage | None:
     """从消息列表末尾向前查找最近一条 HumanMessage（当前轮用户输入）。"""
@@ -309,6 +345,12 @@ def normalize_input(state: TravelHelperState, config: RunnableConfig | None = No
             "extraction_input_text": "",
         }
     normalized = MultimodalInputProcessor.normalize_human_content(last_human.content)
+    logger.info(
+        "[normalize] has_visual=%s text_len=%s content=%s",
+        normalized["has_visual_input"],
+        len(normalized["current_user_text"] or ""),
+        MultimodalInputProcessor.summarize_content_for_log(last_human.content),
+    )
     return normalized
 
 
@@ -458,10 +500,33 @@ def _get_extraction_examples() -> List[Any]:
             sites=["秦始皇兵马俑博物馆", "西安城墙", "大雁塔", "华山"],
         )
     )
+    # 10. 追问轮仅补充缺口（示例中不出现 destination，避免重复抽取或误标）
+    examples.extend(
+        _build_tool_call_example(
+            "从北京出发，2026-05-01 开始。",
+            origin_city="北京",
+            trip_start_date="2026-05-01",
+        )
+    )
+    # 11. 追问轮「字段名：值」写法（与 interrupt 用户回复常见格式一致）
+    examples.extend(
+        _build_tool_call_example(
+            "出发地：上海；开始日期：2026-7-10",
+            origin_city="上海",
+            trip_start_date="2026-07-10",
+        )
+    )
     return examples
 
 
 EXTRACTION_EXAMPLES = _get_extraction_examples()
+
+
+def _updates_from_extraction(extracted: TravelHelperExtraction) -> dict[str, Any]:
+    updates = extracted.model_dump(exclude_none=True)
+    if updates.get("budget_amount") is not None:
+        updates["budget_mode"] = "declared"
+    return updates
 
 
 async def extract_info(state: TravelHelperState, config: RunnableConfig) -> dict[str, Any]:
@@ -469,8 +534,13 @@ async def extract_info(state: TravelHelperState, config: RunnableConfig) -> dict
     text = (state.get("extraction_input_text") or "").strip()
     if not text:
         return {}
+    hint = _intake_context_hint(state)
+    user_message = f"{text}\n\n{hint}" if hint else text
     llm = get_model(config["configurable"].get("model", settings.DEFAULT_MODEL))
-    llm_tools = llm.bind_tools([TravelHelperExtraction])
+    llm_tools = llm.bind_tools(
+        [TravelHelperExtraction],
+        tool_choice="TravelHelperExtraction",
+    )
     prompt = ChatPromptTemplate.from_messages(
         [
             ("system", EXTRACTION_SYSTEM_PROMPT),
@@ -479,37 +549,55 @@ async def extract_info(state: TravelHelperState, config: RunnableConfig) -> dict
         ]
     )
     sub = get_silent_config(config)
+    msgs = prompt.format_messages(examples=EXTRACTION_EXAMPLES, user_message=user_message)
+
+    updates: dict[str, Any] = {}
+    resp = None
     try:
-        msgs = prompt.format_messages(examples=EXTRACTION_EXAMPLES, user_message=text)
-        resp = await llm_tools.ainvoke(msgs, config=sub)
+        try:
+            resp = await llm_tools.ainvoke(msgs, config=sub)
+        except Exception as tool_exc:
+            logger.warning("[extract] 强制 tool_call 失败，回退普通 bind: %s", tool_exc)
+            resp = await llm.bind_tools([TravelHelperExtraction]).ainvoke(msgs, config=sub)
     except Exception as exc:
         logger.error("extract_info failed: %s", exc)
         return {}
-    updates: dict[str, Any] = {}
-    if not getattr(resp, "tool_calls", None):
-        return updates
-    for tc in resp.tool_calls:
-        if tc.get("name") != "TravelHelperExtraction":
-            continue
-        args = _normalize_extraction_args(dict(tc.get("args") or {}))
-        for k, v in args.items():
-            if v is not None:
-                updates[k] = v
-    if updates.get("budget_amount") is not None:
-        updates["budget_mode"] = "declared"
-    if updates:
-        logger.info("[extract] keys=%s", list(updates.keys()))
+
+    if resp and getattr(resp, "tool_calls", None):
+        for tc in resp.tool_calls:
+            if tc.get("name") != "TravelHelperExtraction":
+                continue
+            args = _normalize_extraction_args(dict(tc.get("args") or {}))
+            try:
+                extracted = TravelHelperExtraction(**args)
+            except Exception as exc:
+                logger.warning("TravelHelperExtraction 校验失败: %s", exc)
+                continue
+            updates.update(_updates_from_extraction(extracted))
+        if updates:
+            logger.info("[extract] keys=%s", list(updates.keys()))
+            return updates
+
+    logger.warning("[extract] 无 tool_calls，回退 with_structured_output(TravelHelperExtraction)")
+    try:
+        structured = llm.with_structured_output(TravelHelperExtraction)
+        extracted = await structured.ainvoke(msgs, config=sub)
+        updates = _updates_from_extraction(extracted)
+        if updates:
+            logger.info("[extract] keys=%s (structured)", list(updates.keys()))
+    except Exception as exc:
+        logger.warning("[extract] structured_output 失败: %s", exc)
     return updates
 
 
 def soft_missing_fields(state: TravelHelperState) -> List[str]:
     """规划前「软」必填：缺则可通过 interrupt 追问（受 INTAKE_COLLECT_MAX_ROUNDS 限制）。"""
     missing: List[str] = []
-    if not (state.get("destination") or "").strip():
+    if not coerce_state_str(state.get("destination")):
         missing.append("destination")
-    if not (state.get("origin_city") or "").strip():
+    if not coerce_state_str(state.get("origin_city")):
         missing.append("origin_city")
-    if not (state.get("trip_start_date") or "").strip():
+    if not coerce_state_str(state.get("trip_start_date")):
         missing.append("trip_start_date")
     sites = state.get("sites")
     if not sites or (isinstance(sites, list) and len(sites) == 0):
@@ -517,12 +605,87 @@ def soft_missing_fields(state: TravelHelperState) -> List[str]:
     return missing
 
 
+def _intake_context_hint(state: TravelHelperState) -> str:
+    """抽取时告知 LLM 会话已收集的槽位，追问轮勿重复输出。"""
+    known: list[str] = []
+    dest = coerce_state_str(state.get("destination"))
+    if dest:
+        known.append(f"目的地={dest}")
+    origin = coerce_state_str(state.get("origin_city"))
+    if origin:
+        known.append(f"出发地={origin}")
+    start = coerce_state_str(state.get("trip_start_date"))
+    if start:
+        known.append(f"开始日期={start}")
+    sites = state.get("sites")
+    if sites:
+        known.append(f"景点={sites}")
+    if not known:
+        return ""
+    missing = soft_missing_fields(state)
+    missing_labels = "、".join(FIELD_LABELS.get(f, f) for f in missing) if missing else "无"
+    return (
+        f"【会话已收集】{'；'.join(known)}。"
+        f"仍缺：{missing_labels}。"
+        "请根据用户本轮消息，通过 TravelHelperExtraction 补充或更新相应字段。"
+    )
+
+
 def route_intake_collect(state: TravelHelperState) -> Literal["ask", "proceed"]:
     """抽取后路由：仍缺字段且未超追问上限 → ask_missing；否则进入默认值填充。"""
     rnd = state.get("intake_collect_round") or 0
-    if rnd < INTAKE_COLLECT_MAX_ROUNDS and soft_missing_fields(state):
+    missing = soft_missing_fields(state)
+    if rnd < INTAKE_COLLECT_MAX_ROUNDS and missing:
         return "ask"
+    if missing:
+        logger.info("[intake] 追问轮次已达上限，仍缺字段: %s", missing)
     return "proceed"
+
+
+async def _build_interrupt_multimodal_update(
+    user_response: Any,
+    config: RunnableConfig,
+) -> dict[str, Any]:
+    """interrupt 回合：不把 image_url 写入 checkpoint，在节点内完成 vision→文本。"""
+    logger.info(
+        "[interrupt] 用户回复摘要: %s",
+        MultimodalInputProcessor.summarize_content_for_log(user_response),
+    )
+    update = build_interrupt_text_message_update(user_response)
+    normalized = MultimodalInputProcessor.normalize_human_content(user_response)
+    text_only = (normalized.get("current_user_text") or "").strip()
+
+    if normalized.get("has_visual_input"):
+        llm = get_model(config["configurable"].get("model", settings.DEFAULT_MODEL))
+        vision_text = await MultimodalInputProcessor.vision_to_text(
+            llm,
+            config,
+            VISION_SYSTEM_PROMPT,
+            user_response,
+            logger=logger,
+            log_prefix="[MA Travel interrupt 视觉]",
+        )
+        if text_only and vision_text:
+            merged = f"{text_only}\n\n[图片内容识别]\n{vision_text}"
+        elif vision_text:
+            merged = vision_text
+        else:
+            merged = text_only or ""
+
+        update["extraction_input_text"] = merged
+        if merged:
+            update["messages"] = [HumanMessage(content=merged)]
+        elif "messages" in update:
+            del update["messages"]
+
+    update, fallback_applied = MultimodalInputProcessor.apply_interrupt_image_only_fallback(
+        update,
+        has_visual_input=bool(normalized.get("has_visual_input")),
+        fallback_text=INTERRUPT_IMAGE_ONLY_FALLBACK_TEXT,
+    )
+    if fallback_applied:
+        logger.warning("[interrupt] 仅图输入且识别失败，写入哨兵消息")
+    return update
 
 
 async def ask_missing(state: TravelHelperState, config: RunnableConfig) -> dict[str, Any]:
@@ -531,15 +694,9 @@ async def ask_missing(state: TravelHelperState, config: RunnableConfig) -> dict[
     lines = [f"{i+1}. 请补充：{FIELD_LABELS.get(f, f)}" for i, f in enumerate(missing)]
     prompt = "为完成旅行规划，还需要以下信息：\n" + "\n".join(lines)
     user_response = interrupt(prompt)
-    logger.info("[ask_missing] got user reply len=%s", len(str(user_response)))
-    update = build_interrupt_text_message_update(user_response)
+    update = await _build_interrupt_multimodal_update(user_response, config)
     update["intake_collect_round"] = (state.get("intake_collect_round") or 0) + 1
-    upd, _fb = MultimodalInputProcessor.apply_interrupt_image_only_fallback(
-        update,
-        has_visual_input=bool(state.get("has_visual_input")),
-        fallback_text=INTERRUPT_IMAGE_ONLY_FALLBACK_TEXT,
-    )
-    return upd
+    return update
 
 
 def apply_intake_defaults(state: TravelHelperState, config: RunnableConfig) -> dict[str, Any]:
@@ -566,13 +723,13 @@ def apply_intake_defaults(state: TravelHelperState, config: RunnableConfig) -> d
     if state.get("budget_currency") is None and state.get("budget_amount") is not None:
         updates["budget_currency"] = "CNY"
     for key in ("travel_price_preference", "site_price_preference", "hotel_price_preference"):
-        if not (state.get(key) or "").strip():
+        if not coerce_state_str(state.get(key)):
             updates[key] = NEUTRAL_PRICE_PREF
             applied[key] = NEUTRAL_PRICE_PREF
-    if not (state.get("food_preference") or "").strip():
+    if not coerce_state_str(state.get("food_preference")):
         updates["food_preference"] = "无特殊"
     sites = state.get("sites")
-    dest = (state.get("destination") or "").strip()
+    dest = coerce_state_str(state.get("destination"))
     if (not sites or len(sites) == 0) and dest:
         updates["sites"] = [f"{dest}市区经典游览"]
         applied["sites"] = updates["sites"]
@@ -618,11 +775,11 @@ def build_intake_summary_md(state: TravelHelperState) -> str:
 
 def critical_intake_ok(state: TravelHelperState) -> bool:
     """用户口头「确认」时仍需满足的最小集合；不满足则拒绝进入 persist/检索。"""
-    if not (state.get("destination") or "").strip():
+    if not coerce_state_str(state.get("destination")):
         return False
-    if not (state.get("origin_city") or "").strip():
+    if not coerce_state_str(state.get("origin_city")):
         return False
-    if not (state.get("trip_start_date") or "").strip():
+    if not coerce_state_str(state.get("trip_start_date")):
         return False
     sites = state.get("sites") or []
     if not sites:
@@ -664,7 +821,7 @@ def user_approves(text: str) -> bool:
     return any(k in t for k in ("确认", "同意", "没问题", "可以", "ok", "yes"))
 
 
-def intake_user_confirm(state: TravelHelperState, config: RunnableConfig) -> dict[str, Any]:
+async def intake_user_confirm(state: TravelHelperState, config: RunnableConfig) -> dict[str, Any]:
     """Intake 第二段 HITL：展示摘要 → interrupt → 确认则 intake_confirmed，否则带用户修改回写 messages。"""
     md = build_intake_summary_md(state)
     raw = interrupt(md)
@@ -683,7 +840,7 @@ def intake_user_confirm(state: TravelHelperState, config: RunnableConfig) -> dic
                 )
             ],
         }
-    upd = build_interrupt_text_message_update(raw)
+    upd = await _build_interrupt_multimodal_update(raw, config)
     upd["intake_confirmed"] = False
     upd["intake_confirm_round"] = rnd
     return upd
@@ -735,7 +892,7 @@ def _parse_item_date(val: Any) -> date | None:
 
 def _trip_date_window(state: TravelHelperState) -> tuple[date, date] | None:
     """根据行程开始日与天数得到闭区间 [w0, w1]（含首尾日）；解析失败返回 None。"""
-    start_s = (state.get("trip_start_date") or "").strip()[:10]
+    start_s = coerce_state_str(state.get("trip_start_date"))[:10]
     try:
         ds = datetime.strptime(start_s, "%Y-%m-%d").date()
     except ValueError:
@@ -997,9 +1154,9 @@ def _apply_research_pricing_fallbacks(research_work: dict[str, Any], state: Trav
     party = max(1, int(state.get("party_size") or DEFAULT_PARTY))
     days = max(1, int(state.get("trip_duration_days") or DEFAULT_TRIP_DAYS))
     meals = max(1, int(state.get("meals_per_day") or 2))
-    start_s = (state.get("trip_start_date") or "").strip()[:10]
-    origin = (state.get("origin_city") or "").strip()
-    dest = (state.get("destination") or "").strip()
+    start_s = coerce_state_str(state.get("trip_start_date"))[:10]
+    origin = coerce_state_str(state.get("origin_city"))
+    dest = coerce_state_str(state.get("destination"))
     end_label = ""
     if start_s:
         try:
@@ -1123,9 +1280,9 @@ async def mobility_align_and_budget(state: TravelHelperState, config: RunnableCo
     """
     research_work: dict[str, Any] = dict(state.get("research") or {})
     rebucket_msg = _rebucket_priced_line_items_across_workers(research_work)
-    dest = (state.get("destination") or "").strip()
-    origin = (state.get("origin_city") or "").strip()
-    start = (state.get("trip_start_date") or "").strip()
+    dest = coerce_state_str(state.get("destination"))
+    origin = coerce_state_str(state.get("origin_city"))
+    start = coerce_state_str(state.get("trip_start_date"))
     days = int(state.get("trip_duration_days") or DEFAULT_TRIP_DAYS)
     try:
         dt = datetime.strptime(start[:10], "%Y-%m-%d")
@@ -1351,6 +1508,7 @@ async def compose_itinerary(state: TravelHelperState, config: RunnableConfig) ->
             )
         )
     ]
+    prompt = build_llm_messages(prompt, config)
     resp = await llm.ainvoke(prompt, config)
     body = (resp.content or "").strip()
     return {
@@ -1371,6 +1529,7 @@ def route_after_intake(state: TravelHelperState) -> Literal["persist", "retry"]:
 # 并行语义：自 research_fanout 连出六条边到各 worker_*，LangGraph 会并行调度；
 # 随后六条边均汇入 mobility_budget，等价 fan-in 屏障。
 workflow = StateGraph(TravelHelperState)
+workflow.add_node("prepare_long_term", prepare_long_term_entry)
 workflow.add_node("hydrate_prefs", hydrate_price_preferences)
 workflow.add_node("normalize_input", normalize_input)
 workflow.add_node("vision_enrich", vision_enrich)
@@ -1398,7 +1557,8 @@ def _route_collect(state: TravelHelperState) -> Literal["ask", "proceed"]:
     return route_intake_collect(state)
 
 
-workflow.add_edge(START, "hydrate_prefs")
+workflow.add_edge(START, "prepare_long_term")
+workflow.add_edge("prepare_long_term", "hydrate_prefs")
 workflow.add_edge("hydrate_prefs", "normalize_input")
 workflow.add_conditional_edges(
     "normalize_input",

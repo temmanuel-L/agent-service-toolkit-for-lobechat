@@ -12,11 +12,12 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableConfig
-from langgraph.graph import END, StateGraph
+from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 from pydantic import BaseModel, Field
 
 from core import get_model, settings
+from memory.long_term_concat_for_agents import prepare_long_term_entry
 
 from agents.multi_agent_medical_assistant.guardrails import LocalGuardrails
 from agents.multi_agent_medical_assistant.image_analysis import ImageClassifier
@@ -233,6 +234,7 @@ def apply_guardrails(state: MedicalAgentState, config: RunnableConfig | None = N
 def build_graph():
     workflow = StateGraph(MedicalAgentState)
 
+    workflow.add_node("prepare_long_term", prepare_long_term_entry)
     workflow.add_node("prepare_input", prepare_input)
     workflow.add_node("analyze_input", analyze_input)
     workflow.add_node("route_to_agent", route_to_agent)
@@ -246,7 +248,8 @@ def build_graph():
     workflow.add_node("human_validation", human_validation_node)
     workflow.add_node("apply_guardrails", apply_guardrails)
 
-    workflow.set_entry_point("prepare_input")
+    workflow.add_edge(START, "prepare_long_term")
+    workflow.add_edge("prepare_long_term", "prepare_input")
     workflow.add_edge("prepare_input", "analyze_input")
     workflow.add_edge("analyze_input", "route_to_agent")
 

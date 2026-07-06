@@ -3,6 +3,7 @@ from langgraph_supervisor import create_supervisor
 
 from agents.langgraph_supervisor_agent import add, multiply, web_search
 from core import get_model, settings
+from memory.long_term_concat_for_agents import wrap_agent_with_long_term_entry
 
 model = get_model(settings.DEFAULT_MODEL)
 
@@ -43,4 +44,4 @@ def workflow(chosen_model):
     )  # default name for supervisor is "supervisor".
 
 
-langgraph_supervisor_hierarchy_agent = workflow(model).compile()
+langgraph_supervisor_hierarchy_agent = wrap_agent_with_long_term_entry(workflow(model).compile())

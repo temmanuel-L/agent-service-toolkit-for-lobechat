@@ -89,9 +89,10 @@ class OllamaModelName(StrEnum):
     """https://ollama.com/search"""
 
     # OLLAMA_GENERIC = "alibayram/Qwen3-30B-A3B-Instruct-2507:latest"
-    # OLLAMA_GENERIC = "qwen3:30b-a3b-instruct-16k"
+    # OLLAMA_GENERIC = "sorc/qwen3.5-instruct:9b"
     # OLLAMA_GENERIC = "ministral-3:3b"
     OLLAMA_GENERIC = "frob/qwen3.5-instruct:9b"
+    # OLLAMA_GENERIC = "aisingapore/Gemma-SEA-LION-v4-4B-VL:q4_k_m"
 
 
 class OpenRouterModelName(StrEnum):
@@ -101,9 +102,9 @@ class OpenRouterModelName(StrEnum):
 
 
 class OpenAICompatibleName(StrEnum):
-    """https://platform.openai.com/docs/guides/text-generation"""
+    """OpenAI 兼容网关（如 MiniMax COMPATIBLE_BASE_URL）。"""
 
-    OPENAI_NAME = "MiniMax-M2.7-highspeed"
+    OPENAI_NAME = "MiniMax-M3"
 
 
 class ZhipuModelName(StrEnum):

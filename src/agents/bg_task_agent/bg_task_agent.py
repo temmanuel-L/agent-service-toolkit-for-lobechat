@@ -3,11 +3,12 @@ import asyncio
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig, RunnableLambda, RunnableSerializable
-from langgraph.graph import END, MessagesState, StateGraph
+from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.types import StreamWriter
 
 from agents.bg_task_agent.task import Task
 from core import get_model, settings
+from memory.long_term_concat_for_agents import build_llm_messages, prepare_long_term_entry
 
 
 class AgentState(MessagesState, total=False):
@@ -17,9 +18,13 @@ class AgentState(MessagesState, total=False):
     """
 
 
+def _preprocess_state(state: AgentState, config: RunnableConfig):
+    return build_llm_messages(state["messages"], config)
+
+
 def wrap_model(model: BaseChatModel) -> RunnableSerializable[AgentState, AIMessage]:
     preprocessor = RunnableLambda(
-        lambda state: state["messages"],
+        _preprocess_state,
         name="StateModifier",
     )
     return preprocessor | model  # type: ignore[return-value]
@@ -52,9 +57,11 @@ async def bg_task(state: AgentState, writer: StreamWriter) -> AgentState:
 
 # Define the graph
 agent = StateGraph(AgentState)
+agent.add_node("prepare_long_term", prepare_long_term_entry)
 agent.add_node("model", acall_model)
 agent.add_node("bg_task", bg_task)
-agent.set_entry_point("bg_task")
+agent.add_edge(START, "prepare_long_term")
+agent.add_edge("prepare_long_term", "bg_task")
 
 agent.add_edge("bg_task", "model")
 agent.add_edge("model", END)

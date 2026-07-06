@@ -6,6 +6,7 @@ from langchain_core.runnables import RunnableConfig
 
 from agents.utils import get_silent_config
 from core import get_model, settings
+from memory.long_term_concat_for_agents import concat_system_for_medical
 
 from agents.multi_agent_medical_assistant.state import (
     CONTEXT_LIMIT,
@@ -30,13 +31,16 @@ def run_conversation_agent(
         elif isinstance(m, AIMessage):
             recent += f"Assistant: {getattr(m, 'content', '')}\n"
 
-    sys = """You are an AI Medical Conversation Assistant. Handle general chat and medical questions.
+    sys = concat_system_for_medical(
+        """You are an AI Medical Conversation Assistant. Handle general chat and medical questions.
 Be professional, accurate. For serious concerns, recommend consulting a healthcare professional.
 Do not provide diagnoses or prescriptions.
 Always respond in the SAME LANGUAGE as the user's message (Chinese if user writes in Chinese, English if in English).
 
 IMPORTANT: Do NOT repeat, quote, or include the [长期记忆] / long-term memory content in your response.
-Use it only as background context. For simple greetings (e.g. 你好), respond briefly without listing memory."""
+Use it only as background context. For simple greetings (e.g. 你好), respond briefly without listing memory.""",
+        config,
+    )
 
     model = get_model((config or {}).get("configurable", {}).get("model", settings.DEFAULT_MODEL))
     to_invoke = messages[-CONTEXT_LIMIT:] if len(messages) > CONTEXT_LIMIT else messages

@@ -3,6 +3,10 @@ from langchain_core.messages import BaseMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import StateGraph, START, END, add_messages
 from core import get_model, settings
+from memory.long_term_concat_for_agents import (
+    build_llm_messages,
+    prepare_long_term_entry,
+)
 
 
 # 第一步：定义状态（State）
@@ -18,9 +22,8 @@ async def call_model(state: ChatState, config: RunnableConfig):
     # LangGraph 会自动从 Postgres 中帮你加载并合并好
     model = get_model(config["configurable"].get("model", settings.DEFAULT_MODEL))
 
-    # 如果历史太长，可以在这里进行裁剪再发送给模型
-    # 但存储层仍然是增量的
-    response = await model.ainvoke(state["messages"])
+    messages = build_llm_messages(state["messages"], config)
+    response = await model.ainvoke(messages)
 
     # 关键：只需返回【新增】的部分
     # Reducer 会自动将这个 [response] 追加到数据库的 messages 列表中
@@ -30,11 +33,11 @@ async def call_model(state: ChatState, config: RunnableConfig):
 def build_workflow():
     graph = StateGraph(ChatState)
 
-    # 添加节点
+    graph.add_node("prepare_long_term", prepare_long_term_entry)
     graph.add_node("chatbot", call_model)
 
-    # 设置入口和出口
-    graph.add_edge(START, "chatbot")
+    graph.add_edge(START, "prepare_long_term")
+    graph.add_edge("prepare_long_term", "chatbot")
     graph.add_edge("chatbot", END)
     return graph
 

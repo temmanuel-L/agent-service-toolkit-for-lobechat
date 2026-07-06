@@ -20,11 +20,12 @@ from typing import Any, Literal, Optional
 from pydantic import BaseModel, Field
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
-from langgraph.graph import END, MessagesState, StateGraph
+from langgraph.graph import END, START, MessagesState, StateGraph
 from neo4j_graphrag.retrievers import VectorCypherRetriever, Text2CypherRetriever
 from neo4j_graphrag.schema import get_schema
 
 from core import get_model, get_model_for_neo4j_graphrag, get_embedding_model, settings
+from memory.long_term_concat_for_agents import build_llm_messages, prepare_long_term_entry
 from utils.log_utils import get_logger
 from agents.graph_rag_agent.neo4j_client import get_neo4j_driver
 
@@ -280,19 +281,19 @@ async def rag_sub_intent_node(state: GraphRAGState, config: RunnableConfig) -> d
 
     system_prompt = f"""你是一个 RAG 路由器。请判断用户问题应使用哪种检索方式。
 
-仅当同时满足以下条件时，输出 vector_cypher：
-- 问题是在宽泛地「介绍某公司的投资者/机构股东及持股概况」
-- 不涉及具体日期、季度、比较、排除某机构、item 章节、或库中未收录的公司
-- 与下方某条预定义意图语义高度一致
-
-以下情况必须输出 text2cypher：
-- 含具体日期/季度（如 2020-12-31、2023年第一季度、Q2）
-- 比较两家机构、排除某机构、聚合统计
-- 查询 10-K 某 item 章节内容
-- 查询 Apple/苹果等非 NetApp 公司
-
-预定义意图列表（仅 vector_cypher 可匹配）：
-{intention_list}"""
+                    仅当同时满足以下条件时，输出 vector_cypher：
+                    - 问题是在宽泛地「介绍某公司的投资者/机构股东及持股概况」
+                    - 不涉及具体日期、季度、比较、排除某机构、item 章节、或库中未收录的公司
+                    - 与下方某条预定义意图语义高度一致
+                    
+                    以下情况必须输出 text2cypher：
+                    - 含具体日期/季度（如 2020-12-31、2023年第一季度、Q2）
+                    - 比较两家机构、排除某机构、聚合统计
+                    - 查询 10-K 某 item 章节内容
+                    - 查询 Apple/苹果等非 NetApp 公司
+                    
+                    预定义意图列表（仅 vector_cypher 可匹配）：
+                    {intention_list}"""
 
     try:
         response = await llm_with_tools.with_config(tags=["skip_stream"]).ainvoke(
@@ -433,7 +434,8 @@ async def chat_node(state: GraphRAGState, config: RunnableConfig) -> dict:
     user_text = _last_human_message_text(state)
     llm = get_model(config["configurable"].get("model", settings.DEFAULT_MODEL))
     try:
-        resp = await llm.ainvoke(user_text, config)
+        messages = build_llm_messages([HumanMessage(content=user_text)], config)
+        resp = await llm.ainvoke(messages, config)
         answer = resp.content if hasattr(resp, "content") else str(resp)
         return _make_node_result(answer if isinstance(answer, str) else str(answer))
     except Exception as e:
@@ -468,6 +470,7 @@ def build_graph_rag_agent():
     graph = StateGraph(GraphRAGState)
 
     # 节点
+    graph.add_node("prepare_long_term", prepare_long_term_entry)
     graph.add_node("intent_router", chat_vs_rag_intent_node)
     graph.add_node("rag_sub_intent", rag_sub_intent_node)
     graph.add_node("vector_cypher", vector_cypher_retrieval_node)
@@ -475,7 +478,8 @@ def build_graph_rag_agent():
     graph.add_node("chat", chat_node)
 
     # 边（使用显式 path_map，确保 Mermaid 渲染器能正确识别所有分支和循环）
-    graph.set_entry_point("intent_router")
+    graph.add_edge(START, "prepare_long_term")
+    graph.add_edge("prepare_long_term", "intent_router")
 
     graph.add_conditional_edges(
         "intent_router",

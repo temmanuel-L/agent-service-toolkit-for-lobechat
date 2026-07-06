@@ -7,12 +7,17 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.prompts import SystemMessagePromptTemplate
 from langchain_core.runnables import Runnable, RunnableConfig, RunnableLambda, RunnableSerializable
-from langgraph.graph import END, MessagesState, StateGraph
+from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.store.base import BaseStore
 from langgraph.types import interrupt
 from pydantic import BaseModel, Field
 
 from core import get_model, settings
+from memory.long_term_concat_for_agents import (
+    LONG_TERM_MEMORY_SKIP_KEY,
+    build_llm_messages,
+    prepare_long_term_entry,
+)
 
 # Added logger
 logger = logging.getLogger(__name__)
@@ -28,10 +33,29 @@ class AgentState(MessagesState, total=False):
 
 
 def wrap_model(
-    model: BaseChatModel | Runnable[LanguageModelInput, Any], system_prompt: BaseMessage
+    model: BaseChatModel | Runnable[LanguageModelInput, Any],
+    system_prompt: BaseMessage,
+    *,
+    include_long_term: bool = True,
 ) -> RunnableSerializable[AgentState, Any]:
+    def _preprocess(state: AgentState, config: RunnableConfig):
+        agent_system = (
+            system_prompt.content
+            if isinstance(system_prompt.content, str)
+            else str(system_prompt.content)
+        )
+        if include_long_term:
+            return build_llm_messages(state["messages"], config, agent_system=agent_system)
+        configurable = dict(config.get("configurable") or {})
+        configurable[LONG_TERM_MEMORY_SKIP_KEY] = True
+        return build_llm_messages(
+            state["messages"],
+            {**config, "configurable": configurable},
+            agent_system=agent_system,
+        )
+
     preprocessor = RunnableLambda(
-        lambda state: [system_prompt] + state["messages"],
+        _preprocess,
         name="StateModifier",
     )
     return preprocessor | model
@@ -129,7 +153,9 @@ async def determine_birthdate(
     # If birthdate wasn't retrieved from store, proceed with extraction
     m = get_model(config["configurable"].get("model", settings.DEFAULT_MODEL))
     model_runnable = wrap_model(
-        m.with_structured_output(BirthdateExtraction), birthdate_extraction_prompt.format()
+        m.with_structured_output(BirthdateExtraction),
+        birthdate_extraction_prompt.format(),
+        include_long_term=False,
     ).with_config(tags=["skip_stream"])
     response: BirthdateExtraction = await model_runnable.ainvoke(state, config)
 
@@ -219,11 +245,13 @@ async def generate_response(state: AgentState, config: RunnableConfig) -> AgentS
 
 # Define the graph
 agent = StateGraph(AgentState)
+agent.add_node("prepare_long_term", prepare_long_term_entry)
 agent.add_node("background", background)
 agent.add_node("determine_birthdate", determine_birthdate)
 agent.add_node("generate_response", generate_response)
 
-agent.set_entry_point("background")
+agent.add_edge(START, "prepare_long_term")
+agent.add_edge("prepare_long_term", "background")
 agent.add_edge("background", "determine_birthdate")
 agent.add_edge("determine_birthdate", "generate_response")
 agent.add_edge("generate_response", END)

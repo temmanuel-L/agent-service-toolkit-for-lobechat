@@ -4,15 +4,16 @@ from typing import Annotated, Literal
 from langchain_community.tools import OpenWeatherMapQueryRun
 from langchain_community.utilities import OpenWeatherMapAPIWrapper
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage, SystemMessage
+from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig, RunnableLambda, RunnableSerializable
-from langgraph.graph import END, MessagesState, StateGraph
+from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.managed import RemainingSteps
 from langgraph.prebuilt import ToolNode
 
 from agents.llama_guard import LlamaGuard, LlamaGuardOutput, SafetyAssessment
 from agents.tools import calculator, vector_search_tool, web_search
 from core import get_model, settings
+from memory.long_term_concat_for_agents import build_llm_messages, prepare_long_term_entry
 from rag import (
     create_model_to_tools_router,
     create_reset_rounds_node,
@@ -64,10 +65,14 @@ instructions = f"""
     """
 
 
+def _preprocess_state(state: AgentState, config: RunnableConfig):
+    return build_llm_messages(state["messages"], config, agent_system=instructions)
+
+
 def wrap_model(model: BaseChatModel) -> RunnableSerializable[AgentState, AIMessage]:
     bound_model = model.bind_tools(tools)
     preprocessor = RunnableLambda(
-        lambda state: [SystemMessage(content=instructions)] + state["messages"],
+        _preprocess_state,
         name="StateModifier",
     )
     return preprocessor | bound_model  # type: ignore[return-value]
@@ -131,6 +136,7 @@ MAX_TOOL_ROUNDS = 3
 
 # 定义图
 agent = StateGraph(AgentState)
+agent.add_node("prepare_long_term", prepare_long_term_entry)
 agent.add_node("model", acall_model)
 agent.add_node("tools", create_tools_node_with_rounds_increment(ToolNode(tools)))
 agent.add_node("evaluator", create_rag_evaluator_node(tool_names=["web_search", "vector_search_tool"]))
@@ -138,7 +144,8 @@ agent.add_node("force_done", create_force_done_node())
 agent.add_node("guard_input", llama_guard_input)
 agent.add_node("reset_rounds", create_reset_rounds_node())
 agent.add_node("block_unsafe_content", block_unsafe_content)
-agent.set_entry_point("guard_input")
+agent.add_edge(START, "prepare_long_term")
+agent.add_edge("prepare_long_term", "guard_input")
 
 
 # 检测不安全输入，若命中则阻断后续处理
