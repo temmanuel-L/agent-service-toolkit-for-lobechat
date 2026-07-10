@@ -20,6 +20,7 @@ from agents.music_composer.music_composer import music_composer_agent
 from agents.multi_agent_medical_assistant import multi_agent_medical_assistant
 from agents.parallelization.parallelization_agent import parallelization_agent
 from agents.graph_rag_agent.graph_rag_agent import graph_rag_agent
+from agents.graph_rag_salary.graph_rag_salary import graph_rag_salary
 from schema import AgentInfo
 
 DEFAULT_AGENT = "chatbot"
@@ -90,6 +91,10 @@ agents: dict[str, Agent] = {
     "graph-rag-agent": Agent(
         description="Graph RAG agent with Neo4j VectorCypherRetriever and Text2CypherRetriever.",
         graph_like=graph_rag_agent,
+    ),
+    "graph-rag-salary": Agent(
+        description="Salary Graph RAG agent: chat/RAG routing + ontology Cypher templates.",
+        graph_like=graph_rag_salary,
     ),
 }
 

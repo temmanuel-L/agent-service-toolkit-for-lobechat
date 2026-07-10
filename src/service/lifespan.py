@@ -33,6 +33,10 @@ from langfuse import Langfuse
 from .service import cleanup_manager
 from utils.log_utils import get_logger
 from agents.graph_rag_agent.neo4j_client import set_neo4j_driver, close_neo4j_driver
+from agents.graph_rag_salary.neo4j_client import (
+    get_salary_neo4j_driver,
+    close_salary_neo4j_driver,
+)
 
 logger = get_logger(__name__)
 
@@ -211,6 +215,14 @@ async def lifespan(app) -> AsyncGenerator[None, None]:
             set_neo4j_driver(neo4j_driver)
             logger.info("Neo4j 同步 driver 初始化完成：%s", neo4j_uri)
 
+            # 7b. 薪酬 GraphRAG 专用 Neo4j（默认 7691，与参考 kg_graphrag 对齐）
+            try:
+                salary_driver = get_salary_neo4j_driver()
+                app.state.salary_neo4j_driver = salary_driver
+                logger.info("薪酬 Neo4j driver 初始化完成")
+            except Exception as exc:
+                logger.error("薪酬 Neo4j driver 初始化失败（graph-rag-salary 将不可用）: %s", exc)
+
             # 8. 初始化 MemoryManager（长期记忆）
             if settings.LONG_TERM_MEMORY_ENABLED:
                 memory_manager.vector_manager = vector_manager  # 复用同一个实例
@@ -253,3 +265,8 @@ async def lifespan(app) -> AsyncGenerator[None, None]:
                     logger.info("Neo4j 同步 driver 已关闭")
                 except Exception as exc:
                     logger.error("关闭 Neo4j driver 失败: %s", exc)
+            try:
+                close_salary_neo4j_driver()
+                logger.info("薪酬 Neo4j driver 已关闭")
+            except Exception as exc:
+                logger.error("关闭薪酬 Neo4j driver 失败: %s", exc)
