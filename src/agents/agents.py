@@ -21,6 +21,7 @@ from agents.multi_agent_medical_assistant import multi_agent_medical_assistant
 from agents.parallelization.parallelization_agent import parallelization_agent
 from agents.graph_rag_agent.graph_rag_agent import graph_rag_agent
 from agents.graph_rag_salary.graph_rag_salary import graph_rag_salary
+from agents.salary_graphrag_agent.salary_graphrag_agent import salary_graphrag_agent
 from schema import AgentInfo
 
 DEFAULT_AGENT = "chatbot"
@@ -95,6 +96,10 @@ agents: dict[str, Agent] = {
     "graph-rag-salary": Agent(
         description="Salary Graph RAG agent: chat/RAG routing + ontology Cypher templates.",
         graph_like=graph_rag_salary,
+    ),
+    "salary-graphrag": Agent(
+        description="Salary GraphRAG: multi-task plan + parallel retrieve/chitchat + synthesize.",
+        graph_like=salary_graphrag_agent,
     ),
 }
 
